@@ -29,4 +29,4 @@
 4. Дальше: **`git pull`** перед правками, после — **`git add` / `git commit` / `git push`**.
 
 Альтернатива без веб-формы: **`gh auth login`**, затем  
-`gh repo create platformexp-db-json-bin --public --source=. --remote=origin --push` (из каталога репозитория).
+`gh repo create platformexp-db-json-bin --public --source=. --remote=origin --push` (из каталога репозитория; ветка по умолчанию у вас — **`main`**).
