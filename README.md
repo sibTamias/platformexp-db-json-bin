@@ -4,13 +4,26 @@
 
 Локальная копия — каталог **`~/Projects/platformexp-db-json-bin`** (отдельно от GeoDashboard на 100.254).
 
-## Заливка на 96.43
+## Заливка на 96.43 (с Mac)
 
 ```bash
 ./push_generate_db_json_local.sh mno@161.97.96.43
 ```
 
-На сервере: **`/home/mno/bin/`**, рядом **`.env`** (из **`.env.example`**).
+## На сервере без `cp` каждый раз
+
+1. Один раз клон и симлинки из репозитория в **`~/bin/`** (рядом кладите **`.env`** — как раньше):
+
+```bash
+cd ~
+git clone git@github.com:sibTamias/platformexp-db-json-bin.git
+cd platformexp-db-json-bin
+./install_symlinks.sh
+```
+
+2. Обновление только **`git pull`** в каталоге клона — **перекопировать ничего не нужно**, **`/home/mno/bin/generate_db_json_local.sh`** остаётся ссылкой на файл в репо.
+
+При вызове через **`~/bin/...`** скрипт видит **`BIN=/home/mno/bin`** и читает **`~/bin/.env`**.
 
 ## Синхронизация с evowatch-server-git
 
