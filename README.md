@@ -21,10 +21,10 @@
 1. Создайте **пустой** репозиторий: https://github.com/new — имя **`platformexp-db-json-bin`**, без README/.gitignore (уже есть локально), владелец **`sibTamias`**.
 2. Локально уже настроено:
    - `git remote -v` → `origin git@github.com:sibTamias/platformexp-db-json-bin.git`
-3. Первый пуш:
+3. Первый пуш (ветка **`main`**):
    ```bash
    cd ~/Projects/platformexp-db-json-bin
-   git push -u origin master
+   git push -u origin main
    ```
 4. Дальше: **`git pull`** перед правками, после — **`git add` / `git commit` / `git push`**.
 
