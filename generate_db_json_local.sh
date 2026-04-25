@@ -16,6 +16,8 @@
 #   PARALLEL_JOBS=8 — число параллельных задач (по умолчанию 8)
 #   CURL_WITH_RETRY_MAX_TIME=20 — сек. --max-time в curl_with_retry (по умолчанию 20)
 #   CURL_WITH_RETRY_ATTEMPTS=5 — попыток в curl_with_retry (по умолчанию 5)
+#   PLATFORM_EXPLORER_REQUEST_GAP_MS=0 — пауза перед каждым GET в curl_with_retry и в get_validator_blocks (мс, 0=выкл).
+#   PLATFORM_EXPLORER_REQUEST_JITTER_MS=0 — к паузе добавить случайно 0..N мс (размазывает параллельные воркеры).
 #   CURL_WITH_RETRY_TRACE=1 — на каждую попытку curl_with_retry в diag: CURL_TRACE + CURL_TRACE_CMD
 #                          (готовая команда curl) + тело между CURL_TRACE_BODY_BEGIN/END (до 64 KiB);
 #                          на stderr — команда и укороченное тело. RETRY_LIVE/RETRY_FULL для этих вызовов отключены.
@@ -109,6 +111,7 @@ while [[ $# -gt 0 ]]; do
   CURL_WITH_RETRY_MAX_TIME=20 — секунды --max-time для curl в curl_with_retry (по умолчанию 20).
   CURL_WITH_RETRY_ATTEMPTS=5 — число попыток curl_with_retry (по умолчанию 5; RECOVER — CURL_WITH_RETRY_RECOVER_ATTEMPTS=6).
   CURL_WITH_RETRY_TRACE=1 — по каждой попытке в diag: готовая строка curl + тело ответа (см. шапку скрипта).
+  PLATFORM_EXPLORER_REQUEST_GAP_MS / PLATFORM_EXPLORER_REQUEST_JITTER_MS — пауза перед GET к explorer (см. шапку).
   DB_JSON_TRUNCATE_DIAG_ON_START=1 — обнулить diag/recover перед прогоном (см. --fresh-logs).
 
 Перед работой (если в PATH есть dashmate): сверка .api.block.height с нодой; при отставании
@@ -407,6 +410,27 @@ CURL_WITH_RETRY_ATTEMPTS="${CURL_WITH_RETRY_ATTEMPTS:-5}"
 CURL_WITH_RETRY_RECOVER_ATTEMPTS="${CURL_WITH_RETRY_RECOVER_ATTEMPTS:-6}"
 [[ "$CURL_WITH_RETRY_RECOVER_ATTEMPTS" =~ ^[0-9]+$ ]] || CURL_WITH_RETRY_RECOVER_ATTEMPTS=6
 
+# Снижение одновременного шторма на platform-explorer (localhost): пауза перед GET в curl_with_retry и get_validator_blocks.
+PLATFORM_EXPLORER_REQUEST_GAP_MS="${PLATFORM_EXPLORER_REQUEST_GAP_MS:-0}"
+[[ "$PLATFORM_EXPLORER_REQUEST_GAP_MS" =~ ^[0-9]+$ ]] || PLATFORM_EXPLORER_REQUEST_GAP_MS=0
+PLATFORM_EXPLORER_REQUEST_JITTER_MS="${PLATFORM_EXPLORER_REQUEST_JITTER_MS:-0}"
+[[ "$PLATFORM_EXPLORER_REQUEST_JITTER_MS" =~ ^[0-9]+$ ]] || PLATFORM_EXPLORER_REQUEST_JITTER_MS=0
+
+platform_explorer_pace() {
+    local gap jit r
+    gap="${PLATFORM_EXPLORER_REQUEST_GAP_MS:-0}"
+    jit="${PLATFORM_EXPLORER_REQUEST_JITTER_MS:-0}"
+    [[ "$gap" =~ ^[0-9]+$ ]] || gap=0
+    [[ "$jit" =~ ^[0-9]+$ ]] || jit=0
+    (( gap == 0 && jit == 0 )) && return 0
+    r=0
+    (( jit > 0 )) && r=$((RANDOM % (jit + 1)))
+    local sec
+    sec=$(awk -v g="$gap" -v jr="$r" 'BEGIN { printf "%.4f\n", (g + jr) / 1000 }')
+    [[ "$sec" == "0.0000" || "$sec" == "0" ]] && return 0
+    sleep "$sec"
+}
+
 if [[ -z "${SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK:-}" ]]; then
     if [[ -f "$BIN/check_platform_explorer_vs_dashmate.sh" ]]; then
         bash "$BIN/check_platform_explorer_vs_dashmate.sh" || {
@@ -504,6 +528,7 @@ get_validator_blocks() {
     mkdir -p "$cache_dir"
     local current_total
     local blocks_meta
+    platform_explorer_pace
     blocks_meta=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$PLATFORM_EXPLORER_URL/validator/${validator}/blocks?")
     if [[ -z "${blocks_meta//[$'\t\r\n ']}" ]]; then
         log_api_empty_response "GET_validator_blocks_meta" "$PLATFORM_EXPLORER_URL/validator/${validator}/blocks?" "validator=$validator empty_http_body"
@@ -534,6 +559,7 @@ get_validator_blocks() {
         >"$tail_file"
         for (( gj=j_start; gj <= numPage_new; gj++ )); do
             p_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$gj&limit=100&order=asc"
+            platform_explorer_pace
             p_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$p_url")
             if [[ -z "${p_body//[$'\t\r\n ']}" ]]; then
                 log_api_empty_response "GET_validator_blocks_page" "$p_url" "validator=$validator page=$gj empty_http_body"
@@ -547,6 +573,7 @@ get_validator_blocks() {
             inc_extra=$((inc_extra + 1))
             gj=$((numPage_new + inc_extra))
             p_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$gj&limit=100&order=asc"
+            platform_explorer_pace
             p_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$p_url")
             [[ -n "${p_body//[$'\t\r\n ']}" ]] && echo "$p_body" | jq -r '(.resultSet // [])[].header.height' >>"$temp_file"
             sort -n "$temp_file" | uniq >"${temp_file}.sorted" && mv "${temp_file}.sorted" "$temp_file"
@@ -569,6 +596,7 @@ get_validator_blocks() {
     fi
     for (( j=1; j <= numPage; j++ )); do
         page_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$j&limit=100&order=asc"
+        platform_explorer_pace
         page_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$page_url")
         if [[ -z "${page_body//[$'\t\r\n ']}" ]]; then
             log_api_empty_response "GET_validator_blocks_page" "$page_url" "validator=$validator page=$j empty_http_body"
@@ -581,6 +609,7 @@ get_validator_blocks() {
         extra=$((extra + 1))
         j=$((numPage + extra))
         page_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$j&limit=100&order=asc"
+        platform_explorer_pace
         page_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$page_url")
         [[ -n "${page_body//[$'\t\r\n ']}" ]] && echo "$page_body" | jq -r '(.resultSet // [])[].header.height' >> "$temp_file"
         line_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
@@ -947,6 +976,7 @@ curl_with_retry() {
         delay=3
     fi
     for ((attempt=1; attempt<=max; attempt++)); do
+        platform_explorer_pace
         resp=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" "$url" 2>/dev/null)
         validate_ok=0
         if [[ -n "${resp//[$'\t\r\n ']}" ]]; then
