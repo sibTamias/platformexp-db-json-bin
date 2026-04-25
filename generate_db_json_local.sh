@@ -247,6 +247,31 @@ log_curl_trace_attempt() {
     fi
 }
 
+# При jq_fail в curl_with_retry: вместо stderr jq («parse error…») писать тело ответа в diag и кратко в stderr.
+log_jq_fail_response() {
+    local ctx="$1" attempt="$2" validator="$3" url="$4" required="$5" resp="$6"
+    [[ "${CURL_WITH_RETRY_TRACE:-0}" == "1" ]] && return 0
+    local logf="$DB_JSON_BUILD_DIAG_LOG" lock="$DB_JSON_BUILD_DIAG_LOCK"
+    local ts bytes body req
+    ts=$(date -Is)
+    bytes=$(printf '%s' "${resp:-}" | wc -c | tr -d ' ')
+    body=$(printf '%s' "${resp:-}" | head -c 16384)
+    ctx=$(_diag_sanitize_line "$ctx")
+    validator=$(_diag_sanitize_line "$validator")
+    url=$(_diag_sanitize_line "$url")
+    req=$(_diag_sanitize_line "${required:-_none_}")
+    mkdir -p "$(dirname "$logf")" "$(dirname "$lock")"
+    (
+        flock 400
+        printf '%s\n' "${ts} JQ_FAIL_BODY_BEGIN ctx=${ctx} attempt=${attempt} validator=${validator} body_bytes=${bytes} url=${url} jq_required=${req}"
+        printf '%s\n' "$body"
+        printf '%s\n' "$(date -Is) JQ_FAIL_BODY_END ctx=${ctx} attempt=${attempt}"
+    ) 400>"$lock"
+    printf '%s\n' "${ts} JQ_FAIL_RESPONSE_STDERR ctx=${ctx} attempt=${attempt} validator=${validator} body_bytes=${bytes}" >&2
+    printf '%s\n' "$(printf '%s' "${resp:-}" | head -c 2400)" >&2
+    printf '%s\n' "${ts} JQ_FAIL_RESPONSE_STDERR_END (до 16KiB см. $logf)" >&2
+}
+
 # Граница этапа (как раньше по смыслу — отдельные блоки в логе).
 log_diag_section() {
     [[ "${DB_JSON_DIAG_QUIET:-0}" == "1" ]] && return 0
@@ -925,7 +950,7 @@ curl_with_retry() {
         resp=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" "$url" 2>/dev/null)
         validate_ok=0
         if [[ -n "${resp//[$'\t\r\n ']}" ]]; then
-            if [[ -z "$required" ]] || echo "$resp" | jq -e "$required" >/dev/null 2>&1; then
+            if [[ -z "$required" ]] || echo "$resp" | jq -e "$required" >/dev/null 2>/dev/null; then
                 validate_ok=1
             fi
         fi
@@ -935,13 +960,16 @@ curl_with_retry() {
             jqfail_flag=0
             [[ -n "${resp//[$'\t\r\n ']}" ]] && empty_flag=0
             if [[ "$empty_flag" -eq 0 && -n "$required" ]]; then
-                echo "$resp" | jq -e "$required" >/dev/null 2>&1 || jqfail_flag=1
+                echo "$resp" | jq -e "$required" >/dev/null 2>/dev/null || jqfail_flag=1
             fi
             if [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]]; then
                 u=$(_diag_sanitize_line "$url")
                 live_line="$(date -Is) RETRY_LIVE attempt=${attempt} ctx=${ctx} validator=${validator} empty=${empty_flag} jq_fail=${jqfail_flag} url=${u}"
                 log_diag_append "$live_line"
                 printf '%s\n' "$live_line" >&2
+            fi
+            if [[ "$jqfail_flag" -eq 1 ]]; then
+                log_jq_fail_response "$ctx" "$attempt" "$validator" "$url" "$required" "$resp"
             fi
         fi
         if [[ "$attempt" -eq 2 && "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]]; then
