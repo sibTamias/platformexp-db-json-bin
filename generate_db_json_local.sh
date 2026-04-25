@@ -16,6 +16,11 @@
 #   PARALLEL_JOBS=8 — число параллельных задач (по умолчанию 8)
 #   CURL_WITH_RETRY_MAX_TIME=20 — сек. --max-time в curl_with_retry (по умолчанию 20)
 #   CURL_WITH_RETRY_ATTEMPTS=5 — попыток в curl_with_retry (по умолчанию 5)
+#   CURL_WITH_RETRY_TRACE=1 — на каждую попытку curl_with_retry в diag: CURL_TRACE + CURL_TRACE_CMD
+#                          (готовая команда curl) + тело между CURL_TRACE_BODY_BEGIN/END (до 64 KiB);
+#                          на stderr — команда и укороченное тело. RETRY_LIVE/RETRY_FULL для этих вызовов отключены.
+#   DB_JSON_TRUNCATE_DIAG_ON_START=1 — в начале прогона обнулить generate_db_json_diag.log,
+#                          recover_list.txt, recover_failed.txt (удобно перед ручной отладкой; cron — не задавать).
 #   DB_JSON_DIAG_QUIET=1 — 1: в generate_db_json_diag.log только RETRY/FAIL/HTTP и т.д.;
 #                          0: плюс строки SECTION (границы этапов). По умолчанию 1, если не задано.
 #   SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK=1 — не вызывать сверку высоты API с dashmate (см. check_platform_explorer_vs_dashmate.sh).
@@ -53,8 +58,14 @@ DASH_CLI="${DASH_CLI:-dashmate exec dash_core dash-cli}"
 TEST_RANDOM_LIMIT=0
 # Инкрементальное обновление db.json при той же эпохе (см. --incremental-v1).
 INCREMENTAL_V1=0
+# С opt --fresh-logs или DB_JSON_TRUNCATE_DIAG_ON_START=1 — обнулить diag/recover в начале прогона.
+FRESH_LOGS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --fresh-logs)
+            FRESH_LOGS=1
+            shift
+            ;;
         --incremental-v1)
             INCREMENTAL_V1=1
             shift
@@ -86,6 +97,9 @@ while [[ $# -gt 0 ]]; do
               Скорость: две фазы идут параллельно батчами по PARALLEL_JOBS (как rebuild_arrays);
               при PARALLEL_JOBS=1 будет очень долго на сотнях валидаторов.
 
+  --fresh-logs Обнулить в начале прогона $SAVE_DIR/generate_db_json_diag.log и tmp/recover_*.txt
+              (эквивалент DB_JSON_TRUNCATE_DIAG_ON_START=1). Файлы вроде /tmp/run.txt скрипт не трогает.
+
   --help, -h  Эта справка.
 
 Переменные окружения (см. .env и bin/.env.example):
@@ -94,6 +108,8 @@ while [[ $# -gt 0 ]]; do
   DB_JSON_DIAG_QUIET=0|1 — подробность generate_db_json_diag.log (0 = писать SECTION).
   CURL_WITH_RETRY_MAX_TIME=20 — секунды --max-time для curl в curl_with_retry (по умолчанию 20).
   CURL_WITH_RETRY_ATTEMPTS=5 — число попыток curl_with_retry (по умолчанию 5; RECOVER — CURL_WITH_RETRY_RECOVER_ATTEMPTS=6).
+  CURL_WITH_RETRY_TRACE=1 — по каждой попытке в diag: готовая строка curl + тело ответа (см. шапку скрипта).
+  DB_JSON_TRUNCATE_DIAG_ON_START=1 — обнулить diag/recover перед прогоном (см. --fresh-logs).
 
 Перед работой (если в PATH есть dashmate): сверка .api.block.height с нодой; при отставании
   эксплорера скрипт завершится с ошибкой. Обойти: SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK=1 в .env.
@@ -194,6 +210,41 @@ log_diag_retry_full_block() {
         flock 400
         printf '%s\n' "$(date -Is) RETRY_FULL_END ctx=${ctx} validator=${validator}"
     ) 400>"$lock"
+}
+
+# При CURL_WITH_RETRY_TRACE=1 — человекочитаемая трассировка: команда curl и тело ответа на каждую попытку.
+log_curl_trace_attempt() {
+    local attempt="$1" ctx="$2" validator="$3" url="$4" required="$5" resp="$6" validate_ok="$7"
+    [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]] && return 0
+    local logf="$DB_JSON_BUILD_DIAG_LOG" lock="$DB_JSON_BUILD_DIAG_LOCK"
+    local ts max="${CURL_WITH_RETRY_MAX_TIME:-20}" bytes body cmd_line stderr_body
+    ts=$(date -Is)
+    bytes=$(printf '%s' "${resp:-}" | wc -c | tr -d ' ')
+    body=$(printf '%s' "${resp:-}" | head -c 65536)
+    cmd_line="curl -sS --max-time ${max} $(printf '%q' "$url")"
+    ctx=$(_diag_sanitize_line "$ctx")
+    validator=$(_diag_sanitize_line "$validator")
+    local req_disp="${required:-_none_}"
+    req_disp=$(_diag_sanitize_line "$req_disp")
+    (
+        flock 400
+        printf '%s\n' "${ts} CURL_TRACE attempt=${attempt} ctx=${ctx} validator=${validator} validate_ok=${validate_ok} body_bytes=${bytes} jq_required=${req_disp}"
+        printf '%s\n' "${ts} CURL_TRACE_CMD ${cmd_line}"
+        printf '%s\n' "${ts} CURL_TRACE_BODY_BEGIN"
+        printf '%s\n' "$body"
+        printf '%s\n' "$(date -Is) CURL_TRACE_BODY_END attempt=${attempt}"
+    ) 400>"$lock"
+    stderr_body=$(printf '%s' "${resp:-}" | head -c 1200)
+    printf '%s\n' "${ts} CURL_TRACE attempt=${attempt} ctx=${ctx} validator=${validator} validate_ok=${validate_ok} body_bytes=${bytes}" >&2
+    printf '%s\n' "${ts} CURL_TRACE_CMD ${cmd_line}" >&2
+    if [[ "$bytes" -gt 1200 ]]; then
+        printf '%s\n' "${ts} CURL_TRACE_BODY (первые 1200 байт, полностью в diag.log):" >&2
+        printf '%s\n' "$stderr_body" >&2
+        printf '%s\n' "… [ещё $((bytes - 1200)) байт → $logf]" >&2
+    else
+        printf '%s\n' "${ts} CURL_TRACE_BODY:" >&2
+        printf '%s\n' "$stderr_body" >&2
+    fi
 }
 
 # Граница этапа (как раньше по смыслу — отдельные блоки в логе).
@@ -305,6 +356,13 @@ mkdir -p "$SAVE_DIR/cache/dash"
 mkdir -p "$SAVE_DIR/tmp"
 mkdir -p "$SAVE_DIR/tmp/rebuild_parallel"
 mkdir -p "$SAVE_DIR/tmp/generate_parallel"
+
+# Перед новым прогоном: пустой diag + recover (ручная отладка). В cron обычно не включают.
+if [[ "$FRESH_LOGS" == "1" || "${DB_JSON_TRUNCATE_DIAG_ON_START:-0}" == "1" ]]; then
+    : >"$DB_JSON_BUILD_DIAG_LOG"
+    : >"$DB_JSON_RECOVER_LIST"
+    : >"$DB_JSON_RECOVER_FAILED"
+fi
 
 # Параллелизм: по умолчанию = число ядер CPU (nproc), можно задать PARALLEL_JOBS в .env
 NPROC=$(nproc 2>/dev/null)
@@ -833,6 +891,7 @@ curl_with_retry() {
                 validate_ok=1
             fi
         fi
+        log_curl_trace_attempt "$attempt" "$ctx" "$validator" "$url" "$required" "$resp" "$validate_ok"
         if [[ "$validate_ok" -eq 0 ]]; then
             empty_flag=1
             jqfail_flag=0
@@ -840,12 +899,14 @@ curl_with_retry() {
             if [[ "$empty_flag" -eq 0 && -n "$required" ]]; then
                 echo "$resp" | jq -e "$required" >/dev/null 2>&1 || jqfail_flag=1
             fi
-            u=$(_diag_sanitize_line "$url")
-            live_line="$(date -Is) RETRY_LIVE attempt=${attempt} ctx=${ctx} validator=${validator} empty=${empty_flag} jq_fail=${jqfail_flag} url=${u}"
-            log_diag_append "$live_line"
-            printf '%s\n' "$live_line" >&2
+            if [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]]; then
+                u=$(_diag_sanitize_line "$url")
+                live_line="$(date -Is) RETRY_LIVE attempt=${attempt} ctx=${ctx} validator=${validator} empty=${empty_flag} jq_fail=${jqfail_flag} url=${u}"
+                log_diag_append "$live_line"
+                printf '%s\n' "$live_line" >&2
+            fi
         fi
-        if [[ "$attempt" -eq 2 ]]; then
+        if [[ "$attempt" -eq 2 && "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]]; then
             log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "$validate_ok"
         fi
         if [[ "$validate_ok" -eq 1 ]]; then
@@ -863,11 +924,11 @@ curl_with_retry() {
         printf '%s' "$resp"
     else
         if [[ "${RECOVER_MODE:-0}" == "1" ]]; then
-            log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "0"
+            [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]] && log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "0"
             log_diag_append "$(date -Is) FAIL  ctx=${ctx} validator=${validator} attempts=${max}"
             printf '%s\n' "$validator" >> "${DB_JSON_RECOVER_FAILED}"
         else
-            log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "0"
+            [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]] && log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "0"
             (
                 flock 401
                 printf '%s\t%s\t%s\n' "$ctx" "$validator" "$url" >> "${DB_JSON_RECOVER_LIST}"
