@@ -15,6 +15,7 @@
 #   SAVE_DIR=/home/mno/tmp/withdrawals
 #   PARALLEL_JOBS=8 — число параллельных задач (по умолчанию 8)
 #   CURL_WITH_RETRY_MAX_TIME=20 — сек. --max-time в curl_with_retry (по умолчанию 20)
+#   CURL_WITH_RETRY_ATTEMPTS=5 — попыток в curl_with_retry (по умолчанию 5)
 #   DB_JSON_DIAG_QUIET=1 — 1: в generate_db_json_diag.log только RETRY/FAIL/HTTP и т.д.;
 #                          0: плюс строки SECTION (границы этапов). По умолчанию 1, если не задано.
 #   SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK=1 — не вызывать сверку высоты API с dashmate (см. check_platform_explorer_vs_dashmate.sh).
@@ -92,6 +93,7 @@ while [[ $# -gt 0 ]]; do
   LIMIT_VALIDATORS=N  — первые N из полного списка (не используется при --test).
   DB_JSON_DIAG_QUIET=0|1 — подробность generate_db_json_diag.log (0 = писать SECTION).
   CURL_WITH_RETRY_MAX_TIME=20 — секунды --max-time для curl в curl_with_retry (по умолчанию 20).
+  CURL_WITH_RETRY_ATTEMPTS=5 — число попыток curl_with_retry (по умолчанию 5; RECOVER — CURL_WITH_RETRY_RECOVER_ATTEMPTS=6).
 
 Перед работой (если в PATH есть dashmate): сверка .api.block.height с нодой; при отставании
   эксплорера скрипт завершится с ошибкой. Обойти: SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK=1 в .env.
@@ -315,6 +317,13 @@ CURL_WITH_RETRY_MAX_TIME="${CURL_WITH_RETRY_MAX_TIME:-20}"
 [[ "$CURL_WITH_RETRY_MAX_TIME" =~ ^[0-9]+$ ]] || CURL_WITH_RETRY_MAX_TIME=20
 [[ "$CURL_WITH_RETRY_MAX_TIME" -lt 1 ]] && CURL_WITH_RETRY_MAX_TIME=20
 
+# Число попыток curl_with_retry (по умолчанию 5; при RECOVER_MODE — 6).
+CURL_WITH_RETRY_ATTEMPTS="${CURL_WITH_RETRY_ATTEMPTS:-5}"
+[[ "$CURL_WITH_RETRY_ATTEMPTS" =~ ^[0-9]+$ ]] || CURL_WITH_RETRY_ATTEMPTS=5
+[[ "$CURL_WITH_RETRY_ATTEMPTS" -lt 1 ]] && CURL_WITH_RETRY_ATTEMPTS=5
+CURL_WITH_RETRY_RECOVER_ATTEMPTS="${CURL_WITH_RETRY_RECOVER_ATTEMPTS:-6}"
+[[ "$CURL_WITH_RETRY_RECOVER_ATTEMPTS" =~ ^[0-9]+$ ]] || CURL_WITH_RETRY_RECOVER_ATTEMPTS=6
+
 if [[ -z "${SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK:-}" ]]; then
     if [[ -f "$BIN/check_platform_explorer_vs_dashmate.sh" ]]; then
         bash "$BIN/check_platform_explorer_vs_dashmate.sh" || {
@@ -411,7 +420,7 @@ get_validator_blocks() {
     mkdir -p "$cache_dir"
     local current_total
     local blocks_meta
-    blocks_meta=$(curl -sX GET "$PLATFORM_EXPLORER_URL/validator/${validator}/blocks?")
+    blocks_meta=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$PLATFORM_EXPLORER_URL/validator/${validator}/blocks?")
     if [[ -z "${blocks_meta//[$'\t\r\n ']}" ]]; then
         log_api_empty_response "GET_validator_blocks_meta" "$PLATFORM_EXPLORER_URL/validator/${validator}/blocks?" "validator=$validator empty_http_body"
     fi
@@ -421,8 +430,11 @@ get_validator_blocks() {
         current_total=0
     fi
     if [[ -f "$cache_info_file" && -f "$cache_file" ]]; then
-        local cached_total=$(cat "$cache_info_file")
-        if [[ $cached_total -eq $current_total && $cached_total -ne 0 ]]; then
+        local cached_total cached_lines
+        cached_total=$(tr -d '\r\n ' <"$cache_info_file")
+        cached_lines=$(wc -l <"$cache_file" | tr -d '\r\n ')
+        # Раньше сравнивали только total — при неполной выгрузке страниц в кэше на строку меньше, чем в API (часто «−1 блок»).
+        if [[ "$cached_total" =~ ^[0-9]+$ && "$cached_lines" =~ ^[0-9]+$ && "$cached_total" -eq "$current_total" && "$cached_total" -ne 0 && "$cached_lines" -eq "$current_total" ]]; then
             cat "$cache_file"
             return
         fi
@@ -430,16 +442,31 @@ get_validator_blocks() {
     local temp_file="$SAVE_DIR/tmp/${validator}_blocks.txt"
     > "$temp_file"
     local limit=100
-    local numPage=$(( (current_total+limit)/limit + 1 ))
-    for (( j=1; j <= $numPage; j++ )); do
-        local page_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$j&limit=100&order=asc"
-        local page_body
-        page_body=$(curl -sX GET "$page_url")
+    local numPage=0 j page_url page_body line_count extra
+    if [[ "$current_total" =~ ^[0-9]+$ ]] && (( current_total > 0 )); then
+        numPage=$(( (current_total + limit - 1) / limit ))
+    fi
+    for (( j=1; j <= numPage; j++ )); do
+        page_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$j&limit=100&order=asc"
+        page_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$page_url")
         if [[ -z "${page_body//[$'\t\r\n ']}" ]]; then
             log_api_empty_response "GET_validator_blocks_page" "$page_url" "validator=$validator page=$j empty_http_body"
         fi
         echo "$page_body" | jq -r '(.resultSet // [])[].header.height' >> "$temp_file"
     done
+    line_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
+    extra=0
+    while [[ "$current_total" =~ ^[0-9]+$ && "$line_count" -lt "$current_total" && $extra -lt 40 ]]; do
+        extra=$((extra + 1))
+        j=$((numPage + extra))
+        page_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$j&limit=100&order=asc"
+        page_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$page_url")
+        [[ -n "${page_body//[$'\t\r\n ']}" ]] && echo "$page_body" | jq -r '(.resultSet // [])[].header.height' >> "$temp_file"
+        line_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
+    done
+    if [[ "$extra" -gt 0 ]]; then
+        log_diag_append "$(date -Is) GET_validator_blocks extra_pages validator=$validator extra=$extra total=$current_total lines=$line_count"
+    fi
     cp "$temp_file" "$cache_file"
     echo "$current_total" > "$cache_info_file"
     cat "$temp_file"
@@ -792,10 +819,11 @@ process_validator_rebuild() {
 curl_with_retry() {
     local ctx="$1" validator="$2" url="$3" required="${4:-}"
     local resp="" attempt=0 ok=0 validate_ok=0
-    local max=3 delay=0.7
+    local max="${CURL_WITH_RETRY_ATTEMPTS:-5}" delay=1.0
     local empty_flag jqfail_flag live_line u
     if [[ "${RECOVER_MODE:-0}" == "1" ]]; then
-        max=4; delay=3
+        max="${CURL_WITH_RETRY_RECOVER_ATTEMPTS:-6}"
+        delay=3
     fi
     for ((attempt=1; attempt<=max; attempt++)); do
         resp=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" "$url" 2>/dev/null)
