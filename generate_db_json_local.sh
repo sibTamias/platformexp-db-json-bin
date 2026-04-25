@@ -475,6 +475,7 @@ get_validator_blocks() {
     local cache_dir="$SAVE_DIR/cache/validators"
     local cache_file="$cache_dir/${validator}_all_blocks.txt"
     local cache_info_file="$cache_dir/${validator}_info.txt"
+    local limit=100
     mkdir -p "$cache_dir"
     local current_total
     local blocks_meta
@@ -487,8 +488,8 @@ get_validator_blocks() {
         log_api_empty_response "jq_empty" "$PLATFORM_EXPLORER_URL/validator/${validator}/blocks?" "validator=$validator field=pagination.total"
         current_total=0
     fi
+    local cached_total="" cached_lines=""
     if [[ -f "$cache_info_file" && -f "$cache_file" ]]; then
-        local cached_total cached_lines
         cached_total=$(tr -d '\r\n ' <"$cache_info_file")
         cached_lines=$(wc -l <"$cache_file" | tr -d '\r\n ')
         # Раньше сравнивали только total — при неполной выгрузке страниц в кэше на строку меньше, чем в API (часто «−1 блок»).
@@ -498,8 +499,45 @@ get_validator_blocks() {
         fi
     fi
     local temp_file="$SAVE_DIR/tmp/${validator}_blocks.txt"
+    local tail_file="$SAVE_DIR/tmp/${validator}_blocks_tail.txt"
+    # Инкремент: полный кэш (строк == старый total), API total вырос — догружаем с последней затронутой страницы, merge sort|uniq.
+    if [[ -f "$cache_file" && -f "$cache_info_file" && "$cached_total" =~ ^[0-9]+$ && "$cached_lines" =~ ^[0-9]+$ && "$current_total" =~ ^[0-9]+$ \
+        && "$cached_total" -gt 0 && "$cached_lines" -eq "$cached_total" && "$current_total" -gt "$cached_total" ]]; then
+        local numPage_new j_start inc_lines inc_extra gj p_url p_body
+        numPage_new=$(( (current_total + limit - 1) / limit ))
+        j_start=$(( (cached_total + limit - 1) / limit ))
+        >"$tail_file"
+        for (( gj=j_start; gj <= numPage_new; gj++ )); do
+            p_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$gj&limit=100&order=asc"
+            p_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$p_url")
+            if [[ -z "${p_body//[$'\t\r\n ']}" ]]; then
+                log_api_empty_response "GET_validator_blocks_page" "$p_url" "validator=$validator page=$gj empty_http_body"
+            fi
+            echo "$p_body" | jq -r '(.resultSet // [])[].header.height' >> "$tail_file"
+        done
+        sort -n "$cache_file" "$tail_file" | uniq >"$temp_file"
+        inc_lines=$(wc -l <"$temp_file" | tr -d '\r\n ')
+        inc_extra=0
+        while [[ "$current_total" =~ ^[0-9]+$ && "$inc_lines" -lt "$current_total" && $inc_extra -lt 40 ]]; do
+            inc_extra=$((inc_extra + 1))
+            gj=$((numPage_new + inc_extra))
+            p_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$gj&limit=100&order=asc"
+            p_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$p_url")
+            [[ -n "${p_body//[$'\t\r\n ']}" ]] && echo "$p_body" | jq -r '(.resultSet // [])[].header.height' >>"$temp_file"
+            sort -n "$temp_file" | uniq >"${temp_file}.sorted" && mv "${temp_file}.sorted" "$temp_file"
+            inc_lines=$(wc -l <"$temp_file" | tr -d '\r\n ')
+        done
+        if [[ "$inc_lines" -eq "$current_total" ]]; then
+            [[ "$inc_extra" -gt 0 ]] && log_diag_append "$(date -Is) GET_validator_blocks extra_pages validator=$validator extra=$inc_extra total=$current_total lines=$inc_lines"
+            log_diag_append "$(date -Is) GET_validator_blocks incremental validator=$validator cached_total=$cached_total current_total=$current_total pages=${j_start}-${numPage_new} extra_tail=${inc_extra}"
+            cp "$temp_file" "$cache_file"
+            echo "$current_total" >"$cache_info_file"
+            cat "$temp_file"
+            return
+        fi
+        # Несовпадение после merge — полная перезагрузка ниже
+    fi
     > "$temp_file"
-    local limit=100
     local numPage=0 j page_url page_body line_count extra
     if [[ "$current_total" =~ ^[0-9]+$ ]] && (( current_total > 0 )); then
         numPage=$(( (current_total + limit - 1) / limit ))
