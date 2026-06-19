@@ -6,7 +6,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TARGET="${TARGET_BIN:-$HOME/bin}"
 mkdir -p "$TARGET"
-for f in generate_db_json_local.sh check_platform_explorer_vs_dashmate.sh monitor_new_blocks_count.sh push_generate_db_json_local.sh; do
+for f in generate_db_json_local.sh check_platform_explorer_vs_dashmate.sh monitor_new_blocks_count.sh push_generate_db_json_local.sh update_ip2location_db.sh transfer_ip2location_db.sh update_and_transfer_ip2location_db.sh; do
   [[ -f "$REPO/$f" ]] || { echo "Нет файла: $REPO/$f" >&2; exit 1; }
   ln -sf "$REPO/$f" "$TARGET/$f"
 done

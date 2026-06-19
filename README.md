@@ -29,6 +29,23 @@ cd platformexp-db-json-bin
 
 При правках в другом дереве — вручную `cp` нужных `*.sh` сюда или отсюда, чтобы не расходились две копии.
 
+## IP2Location (раз в месяц, cron на 96.43)
+
+Базы скачиваются **только на platformExp**, затем `rsync` на **46.19.66.201** и **161.97.100.254** (`~/bin/db/`).
+
+1. В **`~/bin/.env`**: `IP2LOCATION_DOWNLOAD_TOKEN=...` (см. `.env.example`)
+2. Проверка:
+   ```bash
+   /home/mno/bin/update_ip2location_db.sh --dry-run
+   /home/mno/bin/update_and_transfer_ip2location_db.sh
+   ```
+3. Cron (2-е число, 03:00):
+   ```bash
+   0 3 2 * * /home/mno/bin/update_and_transfer_ip2location_db.sh >> /home/mno/logs/ip2location_update.log 2>&1
+   ```
+
+Заливка скриптов с Mac: `./push_ip2location_db.sh mno@161.97.96.43` или `git pull` + `./install_symlinks.sh`.
+
 ## GitHub (pull / push)
 
 1. Создайте **пустой** репозиторий: https://github.com/new — имя **`platformexp-db-json-bin`**, без README/.gitignore (уже есть локально), владелец **`sibTamias`**.
