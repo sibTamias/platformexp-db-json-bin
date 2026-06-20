@@ -89,7 +89,7 @@ refresh_geo_cache_remote() {
     ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${host}" bash -s <<REMOTE
 set -e
 mkdir -p "\$(dirname "$REMOTE_GEO_LOG")"
-if pgrep -f "geolocation_hybrid.py --update-all --force" >/dev/null 2>&1; then
+if pgrep -f "python3.*geolocation_hybrid.py --update-all --force" >/dev/null 2>&1; then
     echo "[\$(date '+%F %T')] skip: geolocation_hybrid --force already running" >> "$REMOTE_GEO_LOG"
     exit 0
 fi
