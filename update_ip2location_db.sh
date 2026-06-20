@@ -77,6 +77,29 @@ extract_zip() {
     return 1
 }
 
+is_zip_file() {
+    local zip="$1"
+    [[ -f "$zip" ]] || return 1
+    [[ "$(wc -c < "$zip" | tr -d ' ')" -ge 10000 ]] || return 1
+    [[ "$(head -c 2 "$zip" | od -An -tx1 | tr -d ' \n')" == "504b" ]]
+}
+
+use_existing_staging() {
+    local code="$1"
+    local dest="$2"
+    local expected="$3"
+    local src="$dest/$expected"
+    local size
+
+    [[ -f "$src" ]] || return 1
+    size="$(wc -c < "$src" | tr -d ' ')"
+    if [[ "$size" -lt 1000000 ]]; then
+        return 1
+    fi
+    log "⚠ $code: лимит/ошибка загрузки IP2Location — оставляем существующий $src ($size bytes)"
+    return 0
+}
+
 install_from_zip() {
     local code="$1"
     local expected="$2"
@@ -97,12 +120,29 @@ install_from_zip() {
 
     if ! curl -fSL --retry 3 --retry-delay 5 -o "$zip" "$url"; then
         rm -rf "$tmpdir"
+        if use_existing_staging "$code" "$dest" "$expected"; then
+            return 0
+        fi
         log "✗ Ошибка загрузки $code"
+        return 1
+    fi
+
+    if ! is_zip_file "$zip"; then
+        local api_msg
+        api_msg="$(tr -d '\0' < "$zip" | head -c 160)"
+        rm -rf "$tmpdir"
+        if use_existing_staging "$code" "$dest" "$expected"; then
+            return 0
+        fi
+        log "✗ $code: ответ IP2Location не ZIP (${api_msg:-empty})"
         return 1
     fi
 
     if ! extract_zip "$zip" "$tmpdir/extracted"; then
         rm -rf "$tmpdir"
+        if use_existing_staging "$code" "$dest" "$expected"; then
+            return 0
+        fi
         log "✗ Ошибка распаковки $code"
         return 1
     fi
