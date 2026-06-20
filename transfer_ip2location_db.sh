@@ -1,5 +1,5 @@
 #!/bin/bash
-# Раздача IP2Location баз с platformExp (96.43) на серверы GeoDashboard.
+# Раздача IP2Location и DB-IP баз с platformExp (96.43) на серверы GeoDashboard.
 # Источник: IP2LOCATION_STAGING_DIR (~/tmp/ip2location).
 # Цель на каждом хосте: REMOTE_GEO_DB_DIR (~/bin/db).
 
@@ -53,7 +53,18 @@ required_files=(
     "$SOURCE_DIR/IP2LOCATION-LITE-ASN.MMDB/IP2LOCATION-LITE-ASN.MMDB"
 )
 
-log "IP2Location transfer: $SOURCE_DIR → targets: $TARGET_SERVERS ($REMOTE_DB_DIR)"
+log "Geo DB transfer: $SOURCE_DIR → targets: $TARGET_SERVERS ($REMOTE_DB_DIR)"
+
+dbip_staging=()
+while IFS= read -r -d '' f; do
+    dbip_staging+=("$f")
+done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name 'dbip-asn-lite-*.mmdb' -print0 2>/dev/null || true)
+
+if ((${#dbip_staging[@]} > 0)); then
+    log "DB-IP staging: $(basename "${dbip_staging[0]}")"
+else
+    log "WARN: DB-IP MMDB не найден в staging (rsync только IP2Location)"
+fi
 
 for f in "${required_files[@]}"; do
     if [[ ! -f "$f" ]]; then
@@ -94,17 +105,42 @@ if pgrep -f "python3.*geolocation_hybrid.py --update-all --force" >/dev/null 2>&
     exit 0
 fi
 nohup bash -c '
-    echo "=== IP2Location post-transfer --force \$(date) ===" >> "$REMOTE_GEO_LOG"
+    echo "=== Geo DB post-transfer --force \$(date) ===" >> "$REMOTE_GEO_LOG"
     cd "$REMOTE_DB_DIR"
     nice -n 19 ionice -c 3 python3 geolocation_hybrid.py --update-all --force --quiet >> "$REMOTE_GEO_LOG" 2>&1
     redis-cli -n 1 del geo_dashboard_stats >/dev/null 2>&1 || true
-    echo "=== IP2Location post-transfer done \$(date) ===" >> "$REMOTE_GEO_LOG"
+    echo "=== Geo DB post-transfer done \$(date) ===" >> "$REMOTE_GEO_LOG"
 ' >> /home/mno/logs/ip2location_geo_refresh.log 2>&1 &
 echo "started pid \$!"
 REMOTE
 }
 
+prune_dbip_remote() {
+    local host="$1"
+    local keep_name="$2"
+    [[ -n "$keep_name" ]] || return 0
+
+    log "DB-IP cleanup on $host (keep $keep_name)"
+    ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${host}" bash -s -- "$REMOTE_DB_DIR" "$keep_name" <<'REMOTE'
+set -euo pipefail
+db_dir="$1"
+keep="$2"
+shopt -s nullglob
+for f in "$db_dir"/dbip-asn-lite-*.mmdb; do
+    base="$(basename "$f")"
+    [[ "$base" == "$keep" ]] && continue
+    rm -f "$f"
+    echo "removed $base"
+done
+REMOTE
+}
+
 errors=0
+dbip_keep_name=""
+if ((${#dbip_staging[@]} > 0)); then
+    dbip_keep_name="$(basename "$(printf '%s\n' "${dbip_staging[@]}" | sort | tail -1)")"
+fi
+
 for TARGET_SERVER in $TARGET_SERVERS; do
     log "Transfer to $TARGET_SERVER"
     ensure_host_key "$TARGET_SERVER"
@@ -114,10 +150,16 @@ for TARGET_SERVER in $TARGET_SERVERS; do
 
     if rsync_with_retry "$TARGET_SERVER"; then
         log "✓ $TARGET_SERVER OK"
-        ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${TARGET_SERVER}" \
-            "chmod 644 '$REMOTE_DB_DIR/IP2LOCATION-LITE-DB11.BIN' \
-                '$REMOTE_DB_DIR/IP2LOCATION-LITE-ASN.BIN/IP2LOCATION-LITE-ASN.BIN' \
-                '$REMOTE_DB_DIR/IP2LOCATION-LITE-ASN.MMDB/IP2LOCATION-LITE-ASN.MMDB' 2>/dev/null || true"
+        chmod_cmd="chmod 644 '$REMOTE_DB_DIR/IP2LOCATION-LITE-DB11.BIN' \
+            '$REMOTE_DB_DIR/IP2LOCATION-LITE-ASN.BIN/IP2LOCATION-LITE-ASN.BIN' \
+            '$REMOTE_DB_DIR/IP2LOCATION-LITE-ASN.MMDB/IP2LOCATION-LITE-ASN.MMDB'"
+        if [[ -n "$dbip_keep_name" ]]; then
+            chmod_cmd="$chmod_cmd '$REMOTE_DB_DIR/$dbip_keep_name'"
+        fi
+        ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${TARGET_SERVER}" "$chmod_cmd 2>/dev/null || true"
+        if [[ -n "$dbip_keep_name" ]]; then
+            prune_dbip_remote "$TARGET_SERVER" "$dbip_keep_name"
+        fi
         refresh_geo_cache_remote "$TARGET_SERVER"
     else
         log "✗ $TARGET_SERVER FAILED"
@@ -130,7 +172,7 @@ if [[ "$errors" -gt 0 ]]; then
     exit 1
 fi
 
-log "✓ IP2Location bases sent to all targets"
+log "✓ Geo DB bases sent to all targets"
 if [[ "${REFRESH_GEO_CACHE_AFTER_TRANSFER}" == "1" ]]; then
     log "Geo --force refresh queued on site servers (see $REMOTE_GEO_LOG on each host)"
 fi
