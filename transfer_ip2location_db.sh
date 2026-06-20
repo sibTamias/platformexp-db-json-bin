@@ -17,6 +17,9 @@ TARGET_SERVERS="${TARGET_SERVERS:-46.19.66.201 161.97.100.254}"
 REMOTE_USER="${REMOTE_USER:-mno}"
 RSYNC_RETRY_ATTEMPTS="${RSYNC_RETRY_ATTEMPTS:-5}"
 RSYNC_RETRY_DELAY_SEC="${RSYNC_RETRY_DELAY_SEC:-10}"
+# После rsync: пересчёт geo/Redis на серверах сайта (--update-all --force)
+REFRESH_GEO_CACHE_AFTER_TRANSFER="${REFRESH_GEO_CACHE_AFTER_TRANSFER:-1}"
+REMOTE_GEO_LOG="${REMOTE_GEO_LOG:-/home/mno/logs/geo_cache_update.log}"
 
 CONFIG_FILE="${TRANSFER_IP2LOCATION_CONF:-$BIN/transfer_ip2location.conf}"
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
@@ -78,6 +81,29 @@ rsync_with_retry() {
     return 1
 }
 
+refresh_geo_cache_remote() {
+    local host="$1"
+    [[ "${REFRESH_GEO_CACHE_AFTER_TRANSFER}" == "1" ]] || return 0
+
+    log "Geo cache --force on $host (background, log: $REMOTE_GEO_LOG)"
+    ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${host}" bash -s <<REMOTE
+set -e
+mkdir -p "\$(dirname "$REMOTE_GEO_LOG")"
+if pgrep -f "geolocation_hybrid.py --update-all --force" >/dev/null 2>&1; then
+    echo "[\$(date '+%F %T')] skip: geolocation_hybrid --force already running" >> "$REMOTE_GEO_LOG"
+    exit 0
+fi
+nohup bash -c '
+    echo "=== IP2Location post-transfer --force \$(date) ===" >> "$REMOTE_GEO_LOG"
+    cd "$REMOTE_DB_DIR"
+    nice -n 19 ionice -c 3 python3 geolocation_hybrid.py --update-all --force --quiet >> "$REMOTE_GEO_LOG" 2>&1
+    redis-cli -n 1 del geo_dashboard_stats >/dev/null 2>&1 || true
+    echo "=== IP2Location post-transfer done \$(date) ===" >> "$REMOTE_GEO_LOG"
+' >> /home/mno/logs/ip2location_geo_refresh.log 2>&1 &
+echo "started pid \$!"
+REMOTE
+}
+
 errors=0
 for TARGET_SERVER in $TARGET_SERVERS; do
     log "Transfer to $TARGET_SERVER"
@@ -92,6 +118,7 @@ for TARGET_SERVER in $TARGET_SERVERS; do
             "chmod 644 '$REMOTE_DB_DIR/IP2LOCATION-LITE-DB11.BIN' \
                 '$REMOTE_DB_DIR/IP2LOCATION-LITE-ASN.BIN/IP2LOCATION-LITE-ASN.BIN' \
                 '$REMOTE_DB_DIR/IP2LOCATION-LITE-ASN.MMDB/IP2LOCATION-LITE-ASN.MMDB' 2>/dev/null || true"
+        refresh_geo_cache_remote "$TARGET_SERVER"
     else
         log "✗ $TARGET_SERVER FAILED"
         errors=$((errors + 1))
@@ -104,4 +131,7 @@ if [[ "$errors" -gt 0 ]]; then
 fi
 
 log "✓ IP2Location bases sent to all targets"
+if [[ "${REFRESH_GEO_CACHE_AFTER_TRANSFER}" == "1" ]]; then
+    log "Geo --force refresh queued on site servers (see $REMOTE_GEO_LOG on each host)"
+fi
 exit 0
