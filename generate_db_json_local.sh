@@ -21,8 +21,9 @@
 #   CURL_WITH_RETRY_TRACE=1 — на каждую попытку curl_with_retry в diag: CURL_TRACE + CURL_TRACE_CMD
 #                          (готовая команда curl) + тело между CURL_TRACE_BODY_BEGIN/END (до 64 KiB);
 #                          на stderr — команда и укороченное тело. RETRY_LIVE/RETRY_FULL для этих вызовов отключены.
-#   DB_JSON_TRUNCATE_DIAG_ON_START=1 — в начале прогона обнулить generate_db_json_diag.log,
-#                          recover_list.txt, recover_failed.txt (удобно перед ручной отладкой; cron — не задавать).
+#   DB_JSON_KEEP_DIAG=1 — не обнулять generate_db_json_diag.log в начале прогона (только ручная отладка).
+#   DB_JSON_DEBUG=1 — режим отладки: SECTION, CURL_TRACE, API_DIAG (почему сбой), RETRY_FULL на каждую
+#                     неудачную попытку; без сырых «parse error» от jq в cron.log (см. .env.example).
 #   DB_JSON_DIAG_QUIET=1 — 1: в generate_db_json_diag.log только RETRY/FAIL/HTTP и т.д.;
 #                          0: плюс строки SECTION (границы этапов). По умолчанию 1, если не задано.
 #   SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK=1 — не вызывать сверку высоты API с dashmate (см. check_platform_explorer_vs_dashmate.sh).
@@ -60,7 +61,7 @@ DASH_CLI="${DASH_CLI:-dashmate exec dash_core dash-cli}"
 TEST_RANDOM_LIMIT=0
 # Инкрементальное обновление db.json при той же эпохе (см. --incremental-v1).
 INCREMENTAL_V1=0
-# С opt --fresh-logs или DB_JSON_TRUNCATE_DIAG_ON_START=1 — обнулить diag/recover в начале прогона.
+# --fresh-logs: совместимость (diag обнуляется при каждом запуске по умолчанию).
 FRESH_LOGS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -99,20 +100,20 @@ while [[ $# -gt 0 ]]; do
               Скорость: две фазы идут параллельно батчами по PARALLEL_JOBS (как rebuild_arrays);
               при PARALLEL_JOBS=1 будет очень долго на сотнях валидаторов.
 
-  --fresh-logs Обнулить в начале прогона $SAVE_DIR/generate_db_json_diag.log и tmp/recover_*.txt
-              (эквивалент DB_JSON_TRUNCATE_DIAG_ON_START=1). Файлы вроде /tmp/run.txt скрипт не трогает.
+  --fresh-logs Совместимость: diag/recover обнуляются при каждом запуске (см. DB_JSON_KEEP_DIAG=1).
 
   --help, -h  Эта справка.
 
 Переменные окружения (см. .env и bin/.env.example):
   VALIDATOR_HASH=…     — один валидатор (имеет приоритет над --test).
   LIMIT_VALIDATORS=N  — первые N из полного списка (не используется при --test).
+  DB_JSON_DEBUG=1 — режим отладки: SECTION + CURL_TRACE + API_DIAG (почему сбой) + RETRY_ATTEMPT (attempt>1) + без parse error в cron.
   DB_JSON_DIAG_QUIET=0|1 — подробность generate_db_json_diag.log (0 = писать SECTION).
   CURL_WITH_RETRY_MAX_TIME=20 — секунды --max-time для curl в curl_with_retry (по умолчанию 20).
   CURL_WITH_RETRY_ATTEMPTS=5 — число попыток curl_with_retry (по умолчанию 5; RECOVER — CURL_WITH_RETRY_RECOVER_ATTEMPTS=6).
   CURL_WITH_RETRY_TRACE=1 — по каждой попытке в diag: готовая строка curl + тело ответа (см. шапку скрипта).
   PLATFORM_EXPLORER_REQUEST_GAP_MS / PLATFORM_EXPLORER_REQUEST_JITTER_MS — пауза перед GET к explorer (см. шапку).
-  DB_JSON_TRUNCATE_DIAG_ON_START=1 — обнулить diag/recover перед прогоном (см. --fresh-logs).
+  DB_JSON_KEEP_DIAG=1 — не обнулять diag/recover в начале прогона (накопление между запусками).
 
 Перед работой (если в PATH есть dashmate): сверка .api.block.height с нодой; при отставании
   эксплорера скрипт завершится с ошибкой. Обойти: SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK=1 в .env.
@@ -166,6 +167,11 @@ DB_JSON_RECOVER_LIST="${SAVE_DIR}/tmp/recover_list.txt"
 DB_JSON_RECOVER_FAILED="${SAVE_DIR}/tmp/recover_failed.txt"
 # 1 = в diag.log не писать SECTION (только RETRY/RECOVER/FAIL и сводки). 0 = как раньше.
 DB_JSON_DIAG_QUIET="${DB_JSON_DIAG_QUIET:-1}"
+# DB_JSON_DEBUG=1 — подробный лог для отладки (включает SECTION + CURL_TRACE, см. apply_db_json_debug_mode).
+if [[ "${DB_JSON_DEBUG:-0}" == "1" ]]; then
+    DB_JSON_DIAG_QUIET=0
+    CURL_WITH_RETRY_TRACE="${CURL_WITH_RETRY_TRACE:-1}"
+fi
 
 # Одна строка: убрать переводы строк и лишние пробелы.
 _diag_sanitize_line() {
@@ -203,15 +209,15 @@ log_diag_retry_full_block() {
     mkdir -p "$(dirname "$logf")" "$(dirname "$lock")"
     (
         flock 400
-        printf '%s\n' "$meta"
+        printf '%s\n' "$meta" >>"$logf"
     ) 400>"$lock"
     (
         flock 400
-        printf '%s\n' "$body"
+        printf '%s\n' "$body" >>"$logf"
     ) 400>"$lock"
     (
         flock 400
-        printf '%s\n' "$(date -Is) RETRY_FULL_END ctx=${ctx} validator=${validator}"
+        printf '%s\n' "$(date -Is) RETRY_FULL_END ctx=${ctx} validator=${validator}" >>"$logf"
     ) 400>"$lock"
 }
 
@@ -231,23 +237,15 @@ log_curl_trace_attempt() {
     req_disp=$(_diag_sanitize_line "$req_disp")
     (
         flock 400
-        printf '%s\n' "${ts} CURL_TRACE attempt=${attempt} ctx=${ctx} validator=${validator} validate_ok=${validate_ok} body_bytes=${bytes} jq_required=${req_disp}"
-        printf '%s\n' "${ts} CURL_TRACE_CMD ${cmd_line}"
-        printf '%s\n' "${ts} CURL_TRACE_BODY_BEGIN"
-        printf '%s\n' "$body"
-        printf '%s\n' "$(date -Is) CURL_TRACE_BODY_END attempt=${attempt}"
+        {
+            printf '%s\n' "${ts} CURL_TRACE attempt=${attempt} ctx=${ctx} validator=${validator} validate_ok=${validate_ok} body_bytes=${bytes} jq_required=${req_disp}"
+            printf '%s\n' "${ts} CURL_TRACE_CMD ${cmd_line}"
+            printf '%s\n' "${ts} CURL_TRACE_BODY_BEGIN"
+            printf '%s\n' "$body"
+            printf '%s\n' "$(date -Is) CURL_TRACE_BODY_END attempt=${attempt}"
+        } >>"$logf"
     ) 400>"$lock"
-    stderr_body=$(printf '%s' "${resp:-}" | head -c 1200)
-    printf '%s\n' "${ts} CURL_TRACE attempt=${attempt} ctx=${ctx} validator=${validator} validate_ok=${validate_ok} body_bytes=${bytes}" >&2
-    printf '%s\n' "${ts} CURL_TRACE_CMD ${cmd_line}" >&2
-    if [[ "$bytes" -gt 1200 ]]; then
-        printf '%s\n' "${ts} CURL_TRACE_BODY (первые 1200 байт, полностью в diag.log):" >&2
-        printf '%s\n' "$stderr_body" >&2
-        printf '%s\n' "… [ещё $((bytes - 1200)) байт → $logf]" >&2
-    else
-        printf '%s\n' "${ts} CURL_TRACE_BODY:" >&2
-        printf '%s\n' "$stderr_body" >&2
-    fi
+    # Только diag.log — не stderr: при «cron.log 2>&1» строки CURL_TRACE попадали в response=$(curl_with_retry).
 }
 
 # При jq_fail в curl_with_retry: вместо stderr jq («parse error…») писать тело ответа в diag и кратко в stderr.
@@ -273,6 +271,67 @@ log_jq_fail_response() {
     printf '%s\n' "${ts} JQ_FAIL_RESPONSE_STDERR ctx=${ctx} attempt=${attempt} validator=${validator} body_bytes=${bytes}" >&2
     printf '%s\n' "$(printf '%s' "${resp:-}" | head -c 2400)" >&2
     printf '%s\n' "${ts} JQ_FAIL_RESPONSE_STDERR_END (до 16KiB см. $logf)" >&2
+}
+
+# Краткий разбор ответа API при validate_ok=0 (почему не прошёл jq-фильтр).
+log_api_response_diag() {
+    local ctx="$1" validator="$2" url="$3" required="$4" resp="$5" attempt="${6:-}"
+    local bytes=0 json_ok=0 jq_ok=0 has_protx=0 why="" api_err="" api_msg="" preview=""
+    bytes=$(printf '%s' "${resp:-}" | wc -c | tr -d ' ')
+    preview=$(_diag_sanitize_line "$(printf '%s' "${resp:-}" | head -c 240)")
+    if [[ -n "${resp//[$'\t\r\n ']}" ]] && echo "$resp" | jq -e . >/dev/null 2>&1; then
+        json_ok=1
+        api_err=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null)
+        api_msg=$(echo "$resp" | jq -r '.message // empty' 2>/dev/null)
+        [[ -n "$required" ]] && echo "$resp" | jq -e "$required" >/dev/null 2>&1 && jq_ok=1
+        echo "$resp" | jq -e '.proTxInfo != null' >/dev/null 2>&1 && has_protx=1
+    fi
+    if [[ "$json_ok" -eq 0 ]]; then
+        why="ответ не JSON (explorer вернул не объект; jq parse error в cron подавлен — см. preview)"
+    elif [[ -n "$api_err" && "$api_err" != "null" ]]; then
+        why="API .error=${api_err}"
+    elif [[ -n "$api_msg" && "$api_msg" != "null" ]]; then
+        why="API .message=${api_msg}"
+    elif [[ -n "$required" && "$jq_ok" -eq 0 ]]; then
+        why="фильтр не выполнен: ${required} (нет proTxInfo или не тот тип ответа)"
+    else
+        why="validate_ok=0 (пустое тело или неизвестная причина)"
+    fi
+    ctx=$(_diag_sanitize_line "$ctx")
+    validator=$(_diag_sanitize_line "$validator")
+    url=$(_diag_sanitize_line "$url")
+    required=$(_diag_sanitize_line "${required:-_none_}")
+    local line
+    line="$(date -Is) API_DIAG ctx=${ctx} validator=${validator} attempt=${attempt} bytes=${bytes} json=${json_ok} jq_filter_ok=${jq_ok} has_proTxInfo=${has_protx} | ${why}"
+    log_diag_append "$line"
+    if [[ "${DB_JSON_DEBUG:-0}" == "1" ]]; then
+        printf '%s\n' "$line" >&2
+        printf '%s\n' "  url=${url}" >&2
+        [[ -n "$preview" ]] && printf '%s\n' "  preview=${preview}" >&2
+    fi
+}
+
+# jq -r без «parse error» в stderr; при DB_JSON_DEBUG=1 — причина в diag.
+diag_jq_r() {
+    local field="$1" filter="$2" data="$3" default="${4:-}"
+    if [[ -z "${data//[$'\t\r\n ']}" ]]; then
+        [[ "${DB_JSON_DEBUG:-0}" == "1" ]] && log_diag_append "$(date -Is) JQ_FIELD field=${field} status=skip reason=пустой_response_after_curl"
+        printf '%s' "$default"
+        return 1
+    fi
+    if ! echo "$data" | jq -e . >/dev/null 2>&1; then
+        [[ "${DB_JSON_DEBUG:-0}" == "1" ]] && log_diag_append "$(date -Is) JQ_FIELD field=${field} status=skip reason=не_JSON preview=$(_diag_sanitize_line "$(printf '%s' "$data" | head -c 160)")"
+        printf '%s' "$default"
+        return 1
+    fi
+    local out
+    if out=$(echo "$data" | jq -r "$filter" 2>/dev/null); then
+        printf '%s' "$out"
+        return 0
+    fi
+    [[ "${DB_JSON_DEBUG:-0}" == "1" ]] && log_diag_append "$(date -Is) JQ_FIELD field=${field} status=skip reason=jq_r_failed filter=$(_diag_sanitize_line "$filter")"
+    printf '%s' "$default"
+    return 1
 }
 
 # Граница этапа (как раньше по смыслу — отдельные блоки в логе).
@@ -385,11 +444,16 @@ mkdir -p "$SAVE_DIR/tmp"
 mkdir -p "$SAVE_DIR/tmp/rebuild_parallel"
 mkdir -p "$SAVE_DIR/tmp/generate_parallel"
 
-# Перед новым прогоном: пустой diag + recover (ручная отладка). В cron обычно не включают.
-if [[ "$FRESH_LOGS" == "1" || "${DB_JSON_TRUNCATE_DIAG_ON_START:-0}" == "1" ]]; then
+# Перед каждым прогоном: пустой diag + recover (как cron.log в run_withdrawals_and_transfer_local.sh).
+if [[ "${DB_JSON_KEEP_DIAG:-0}" != "1" ]]; then
     : >"$DB_JSON_BUILD_DIAG_LOG"
     : >"$DB_JSON_RECOVER_LIST"
     : >"$DB_JSON_RECOVER_FAILED"
+fi
+
+if [[ "${DB_JSON_DEBUG:-0}" == "1" ]]; then
+    echo "[$(date -Is)] DB_JSON_DEBUG=1: подробный лог — SECTION, CURL_TRACE, API_DIAG, JQ_FIELD; файл: $DB_JSON_BUILD_DIAG_LOG" >&2
+    echo "  tail -f $DB_JSON_BUILD_DIAG_LOG   или   tail -f /home/mno/tmp/cron.log" >&2
 fi
 
 # Параллелизм: по умолчанию = число ядер CPU (nproc), можно задать PARALLEL_JOBS в .env
@@ -914,13 +978,19 @@ process_validator_rebuild() {
     firstBlockEpoch=${epoch_first_blocks[$curEpoch]}
     lastBlockEpoch=${epoch_last_blocks[$curEpoch]}
     current_epoch_blocks=$(awk -v b="$firstBlockEpoch" -v c="$lastBlockEpoch" '$1 >= b && $1 <= c {count++} END {print count+0}' "$blocks_file")
-    response=$(curl_with_retry "GET_validator" "$validator" "$PLATFORM_EXPLORER_URL/validator/$validator" '.proTxInfo != null')
-    identityBalance=$(echo "$response" | jq -r '.identityBalance // 0')
+    local response
+    # 2>/dev/null: CURL_TRACE при DB_JSON_DEBUG идёт в stderr; при 2>&1 в cron он не должен попадать в $().
+    response=$(curl_with_retry "GET_validator" "$validator" "$PLATFORM_EXPLORER_URL/validator/$validator" '.proTxInfo != null' 2>/dev/null)
+    if [[ -z "${response//[$'\t\r\n ']}" ]]; then
+        log_diag_append "$(date -Is) GET_validator_EMPTY validator=${validator} | curl_with_retry не вернул тело (все попытки не прошли фильтр; см. API_DIAG/RECOVER)"
+        [[ "${DB_JSON_DEBUG:-0}" == "1" ]] && printf '%s\n' "$(date -Is) GET_validator_EMPTY ${validator:0:16}… — пустой ответ, валидатор уйдёт в recover" >&2
+    fi
+    identityBalance=$(diag_jq_r identityBalance '.identityBalance // 0' "$response" "0")
     identityBalance=$(awk -v ib="${identityBalance:-0}" 'BEGIN {printf "%.4f", (ib+0)/100000000000}')
-    identity=$(echo "$response" | jq -r '.identityId // .identity // empty')
+    identity=$(diag_jq_r identity '.identityId // .identity // empty' "$response" "")
     [[ -z "$identity" || "$identity" == "null" ]] && identity=""
 
-    service_raw=$(echo "$response" | jq -r '.proTxInfo.state.service // empty' 2>/dev/null) || service_raw=""
+    service_raw=$(diag_jq_r service_raw '.proTxInfo.state.service // empty' "$response" "") || service_raw=""
     if [[ -z "${response//[$'\t\r\n ']}" ]]; then
         :
     elif ! echo "$response" | jq -e . &>/dev/null; then
@@ -942,7 +1012,7 @@ process_validator_rebuild() {
     if [[ -n "$service_raw" && "$service_raw" != "null" && -z "$service" ]]; then
         : # quieted: covered by RETRY/FAIL
     fi
-    registeredHeight=$(echo "$response" | jq -r '.proTxInfo.state.registeredHeight // empty')
+    registeredHeight=$(diag_jq_r registeredHeight '.proTxInfo.state.registeredHeight // empty' "$response" "")
     registeredTime=""
     if [[ -n "$registeredHeight" && "$registeredHeight" != "null" ]]; then
         ts=$(cached_block_timestamp "$registeredHeight")
@@ -960,10 +1030,27 @@ process_validator_rebuild() {
 }
 
 
+# Любая попытка curl_with_retry > 1 — одна строка в diag (где и с каким исходом).
+log_retry_attempt_event() {
+    local attempt="$1" max="$2" outcome="$3" ctx="$4" validator="$5" url="$6"
+    local empty_flag="${7:-}" jqfail_flag="${8:-}"
+    (( attempt > 1 )) || return 0
+    local u stage line
+    u=$(_diag_sanitize_line "$url")
+    ctx=$(_diag_sanitize_line "$ctx")
+    validator=$(_diag_sanitize_line "$validator")
+    stage="normal"
+    [[ "${RECOVER_MODE:-0}" == "1" ]] && stage="recover"
+    line="$(date -Is) RETRY_ATTEMPT attempt=${attempt}/${max} outcome=${outcome} ctx=${ctx} validator=${validator} stage=${stage} url=${u}"
+    if [[ "$outcome" == "fail" ]]; then
+        line+=" empty=${empty_flag} jq_fail=${jqfail_flag}"
+    fi
+    log_diag_append "$line"
+}
+
 # === curl_with_retry: тихий ретрай для одиночных GET к platform-explorer ===
-# При каждой неудачной попытке: RETRY_LIVE в diag + stderr (сразу в tail -f diag.log и в cron.log при 2>&1).
-# На 2-й попытке — RETRY_FULL_* (BEGIN/тело/END отдельными flock). При полном FAIL — ещё один RETRY_FULL последнего ответа.
-# Короткий RETRY/RECOVER — только при успехе с 3-й+.
+# При каждой неудачной попытке: RETRY_LIVE в diag + stderr (если не CURL_WITH_RETRY_TRACE).
+# attempt>1: RETRY_ATTEMPT в diag (ctx, validator, url, outcome). При полном FAIL — FAIL ctx=.
 # Использование:
 #   resp=$(curl_with_retry CTX HASH URL [JQ_REQUIRED])
 curl_with_retry() {
@@ -998,11 +1085,13 @@ curl_with_retry() {
                 log_diag_append "$live_line"
                 printf '%s\n' "$live_line" >&2
             fi
+            log_api_response_diag "$ctx" "$validator" "$url" "$required" "$resp" "$attempt"
             if [[ "$jqfail_flag" -eq 1 ]]; then
                 log_jq_fail_response "$ctx" "$attempt" "$validator" "$url" "$required" "$resp"
             fi
+            log_retry_attempt_event "$attempt" "$max" "fail" "$ctx" "$validator" "$url" "$empty_flag" "$jqfail_flag"
         fi
-        if [[ "$attempt" -eq 2 && "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]]; then
+        if [[ ( "$attempt" -eq 2 || "${DB_JSON_DEBUG:-0}" == "1" ) && "${CURL_WITH_RETRY_TRACE:-0}" != "1" && "$validate_ok" -eq 0 ]]; then
             log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "$validate_ok"
         fi
         if [[ "$validate_ok" -eq 1 ]]; then
@@ -1012,16 +1101,12 @@ curl_with_retry() {
         sleep "$delay"
     done
     if (( ok )); then
-        if [[ "${RECOVER_MODE:-0}" == "1" ]]; then
-            (( attempt > 2 )) && log_diag_append "$(date -Is) RECOVER ctx=${ctx} validator=${validator} attempt=${attempt}"
-        elif (( attempt > 2 )); then
-            log_diag_append "$(date -Is) RETRY ctx=${ctx} validator=${validator} attempt=${attempt}"
-        fi
+        log_retry_attempt_event "$attempt" "$max" "ok" "$ctx" "$validator" "$url"
         printf '%s' "$resp"
     else
         if [[ "${RECOVER_MODE:-0}" == "1" ]]; then
             [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]] && log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "0"
-            log_diag_append "$(date -Is) FAIL  ctx=${ctx} validator=${validator} attempts=${max}"
+            log_diag_append "$(date -Is) FAIL  ctx=${ctx} validator=${validator} attempts=${max} url=$(_diag_sanitize_line "$url")"
             printf '%s\n' "$validator" >> "${DB_JSON_RECOVER_FAILED}"
         else
             [[ "${CURL_WITH_RETRY_TRACE:-0}" != "1" ]] && log_diag_retry_full_block "$ctx" "$validator" "$url" "$required" "$resp" "0"
@@ -1129,6 +1214,12 @@ rebuild_arrays() {
     echo "  [rebuild_arrays] epoch_first/last_blocks: $((t_epoch_end - t_epoch)) сек"
     # Эпохи 0..(curEpoch-1) закрыты и не меняются — кэшируем. Только curEpoch пересчитываем.
     fixed_max=$((curEpoch - 1))
+    # После догоняния индексера старый кэш мог записать blocks=0 для недавних эпох — пересчитать:
+    if [[ "${DB_JSON_REFRESH_CLOSED_EPOCHS:-0}" == "1" && $fixed_max -ge 1 ]]; then
+        echo "  [кэш] DB_JSON_REFRESH_CLOSED_EPOCHS=1: сброс confirmed/withdrawals через эпоху $fixed_max"
+        rm -f "$SAVE_DIR/cache/validators/"*_confirmed_through_"${fixed_max}".txt
+        rm -f "$SAVE_DIR/cache/validators/"*_withdrawals_through_"${fixed_max}".json
+    fi
     > "$SAVE_DIR/tmp/epoch_bounds.txt"
     for epoch in $(seq 0 "$curEpoch"); do
         echo "${epoch}:${epoch_first_blocks[$epoch]}:${epoch_last_blocks[$epoch]}" >> "$SAVE_DIR/tmp/epoch_bounds.txt"
@@ -1346,6 +1437,22 @@ process_validator_generate() {
     local identity="${IDENTITIES[$i]}"
     [[ -z "$identity" || "$identity" == "null" ]] && identity=""
     local service="${SERVICES[$i]}"
+    # Если rebuild не записал identity (баг/кэш), подтянуть из API — иначе withdrawal=0 у всех.
+    if [[ -z "$identity" ]]; then
+        local _vresp
+        _vresp=$(curl_with_retry "GET_validator" "$validator_hash" "$PLATFORM_EXPLORER_URL/validator/$validator_hash" '.proTxInfo != null' 2>/dev/null)
+        identity=$(diag_jq_r identity '.identityId // .identity // empty' "$_vresp" "")
+        [[ -z "$identity" || "$identity" == "null" ]] && identity=""
+        if [[ -z "$service" || "$service" == "null" ]]; then
+            service=$(echo "$_vresp" | jq -r '
+              (.proTxInfo.state.service // "") |
+              if . == "" or . == null then ""
+              elif test("^\\[[^]]+\\]:") then (capture("^\\[(?<h>[^]]+)\\]:") | .h)
+              elif test(":[0-9]+$") then sub(":[0-9]+$"; "")
+              else . end
+            ' 2>/dev/null) || service=""
+        fi
+    fi
     local identityBalance="${IDENTITYBALANCE[$i]}"
     local registered_time="${REGISTERED_TIMES[$i]}"
     [[ "$registered_time" == "0" || "$registered_time" == "0000" || -z "$registered_time" ]] && registered_time=""
@@ -1374,7 +1481,7 @@ process_validator_generate() {
     local response
     if [[ -n "$identity" ]]; then
         local _wurl="${PLATFORM_EXPLORER_URL}/identity/${identity}/withdrawals?page=1&limit=100"
-        response=$(curl_with_retry "GET_identity_withdrawals" "$validator_hash" "$_wurl" '.resultSet != null')
+        response=$(curl_with_retry "GET_identity_withdrawals" "$validator_hash" "$_wurl" '.resultSet != null' 2>/dev/null)
     else
         response='{"resultSet":[]}'
     fi
@@ -1483,18 +1590,18 @@ incremental_v1_patch_worker() {
     identity=$(jq -r --arg xx "$h" '.validators[$xx].identity // empty' "$json_file")
     [[ -z "$identity" || "$identity" == "null" ]] && identity=""
 
-    response=$(curl_with_retry "GET_validator" "$h" "$PLATFORM_EXPLORER_URL/validator/$h" '.proTxInfo != null')
-    identityBalance=$(echo "$response" | jq -r '.identityBalance // 0')
+    response=$(curl_with_retry "GET_validator" "$h" "$PLATFORM_EXPLORER_URL/validator/$h" '.proTxInfo != null' 2>/dev/null)
+    identityBalance=$(diag_jq_r identityBalance '.identityBalance // 0' "$response" "0")
     identityBalance=$(awk -v ib="${identityBalance:-0}" 'BEGIN {printf "%.4f", (ib+0)/100000000000}')
     if [[ -z "$identity" ]]; then
-        identity=$(echo "$response" | jq -r '.identityId // .identity // empty')
+        identity=$(diag_jq_r identity '.identityId // .identity // empty' "$response" "")
         [[ -z "$identity" || "$identity" == "null" ]] && identity=""
     fi
 
     declare -A epoch_amounts=()
     if [[ -n "$identity" ]]; then
         _wurl="${PLATFORM_EXPLORER_URL}/identity/${identity}/withdrawals?page=1&limit=100"
-        wresp=$(curl_with_retry "GET_identity_withdrawals" "$h" "$_wurl" '.resultSet != null')
+        wresp=$(curl_with_retry "GET_identity_withdrawals" "$h" "$_wurl" '.resultSet != null' 2>/dev/null)
         while IFS=$'\t' read -r timestamp amount; do
             [[ -z "$timestamp" || "$amount" == "null" ]] && continue
             unix_time=$(date -d "$timestamp" +%s%3N 2>/dev/null)
@@ -1792,6 +1899,9 @@ generate_json_db() {
     fi
     # Эпохи 1..(curEpoch-1) закрыты и не меняются — кэшируем. Только curEpoch пересчитываем.
     fixed_epoch_max=$((curEpoch - 1))
+    if [[ "${DB_JSON_REFRESH_CLOSED_EPOCHS:-0}" == "1" && $fixed_epoch_max -ge 1 ]]; then
+        rm -f "$SAVE_DIR/cache/validators/"*_withdrawals_through_"${fixed_epoch_max}".json
+    fi
     t_setup_end=$(date +%s)
     echo "  [generate_json_db] подготовка (epochs, rewards, json_data): $((t_setup_end - t_start)) сек"
     echo "  [файл] подготовка: читаем $EPOCH_BLOCKS_COUNT_L1_FILE, $EPOCH_BLOCKS_COUNT_L2_FILE, $SAVE_DIR/epoch_intervals.txt"
