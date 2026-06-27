@@ -96,7 +96,7 @@ while [[ $# -gt 0 ]]; do
               generate_json_db. Нужны готовые $SAVE_DIR/db.json (current_epoch = API),
               tmp/epoch_bounds.txt, epoch_intervals.txt, epoch_blocks_count_L1/L2.txt после
               полного прогона. Обновляет по каждому валидатору: identityBalance, rating,
-              строку withdrawals для текущей эпохи (blocks, withdrawal, validator_credits_value).
+              строку withdrawals для текущей эпохи (blocks, withdrawal).
               Скорость: две фазы идут параллельно батчами по PARALLEL_JOBS (как rebuild_arrays);
               при PARALLEL_JOBS=1 будет очень долго на сотнях валидаторов.
 
@@ -1173,7 +1173,7 @@ rebuild_arrays() {
     [[ -f "$CUR_EPOCH_FILE" ]] && saved_epoch=$(cat "$CUR_EPOCH_FILE")
     echo "$curEpoch" > "$CUR_EPOCH_FILE"
     echo "Текущая эпоха: $curEpoch"
-    # Всегда пересчитываем L1/L2 — иначе epoch_block_reward_L2 пустой и validator_credits_value везде 0
+    # Всегда пересчитываем L1/L2 — иначе epoch_block_reward_L2 пустой
     t_l1=$(date +%s)
     calculate_epoch_blocks_count_L1 $curEpoch
     t_l1_end=$(date +%s)
@@ -1512,55 +1512,45 @@ process_validator_generate() {
             [[ -n "$registration_epoch" && "$registration_epoch" =~ ^[0-9]+$ && "$epoch" -lt "$registration_epoch" ]] && continue
             amount=${epoch_amounts[$epoch]:-0}
             amount=$(awk "BEGIN {printf \"%.1f\", $amount/100000000000}")
-            validator_blocks="${epoch_blocks[$epoch]}"
-            validator_credits_value="0"
-            if [[ -n "${epoch_block_reward_L2[$epoch]}" && "${epoch_block_reward_L2[$epoch]}" != "0" && -n "$validator_blocks" && "$validator_blocks" -gt 0 ]]; then
-                validator_credits_value=$(echo "scale=8; $validator_blocks * ${epoch_block_reward_L2[$epoch]}" | bc)
-            fi
-            recent_json=$(jq --arg e "$epoch" --arg b "${epoch_blocks[$epoch]}" --arg a "$amount" --arg vcv "$validator_credits_value" '. += [{"epoch": $e | tonumber, "blocks": $b | tonumber, "withdrawal": $a | tonumber, "validator_credits_value": (if $vcv == "" then "0" else $vcv | tonumber end)}]' <<< "$recent_json")
+            recent_json=$(jq --arg e "$epoch" --arg b "${epoch_blocks[$epoch]}" --arg a "$amount" '. += [{"epoch": $e | tonumber, "blocks": $b | tonumber, "withdrawal": $a | tonumber}]' <<< "$recent_json")
         done
         for epoch in "${!epoch_amounts[@]}"; do
             [[ ! "$epoch" =~ ^[0-9]+$ || $epoch -eq 0 || $epoch -lt $((fixed_epoch_max + 1)) ]] && continue
             [[ -n "$registration_epoch" && "$registration_epoch" =~ ^[0-9]+$ && "$epoch" -lt "$registration_epoch" ]] && continue
             [[ -z "${epoch_blocks[$epoch]}" ]] || continue
             amount=$(awk "BEGIN {printf \"%.1f\", ${epoch_amounts[$epoch]}/100000000000}")
-            recent_json=$(jq --arg e "$epoch" --arg a "$amount" '. += [{"epoch": $e | tonumber, "blocks": 0, "withdrawal": $a | tonumber, "validator_credits_value": 0}]' <<< "$recent_json")
+            recent_json=$(jq --arg e "$epoch" --arg a "$amount" '. += [{"epoch": $e | tonumber, "blocks": 0, "withdrawal": $a | tonumber}]' <<< "$recent_json")
         done
-        epochs_json=$(jq -n --argjson c "$cached_epochs" --argjson r "$recent_json" '($c + $r) | sort_by(.epoch)')
+        epochs_json=$(jq -n --argjson c "$cached_epochs" --argjson r "$recent_json" '($c + $r) | map({epoch, blocks, withdrawal}) | sort_by(.epoch)')
     else
         for epoch in "${!epoch_blocks[@]}"; do
             [[ $epoch -eq 0 ]] && continue
             [[ -n "$registration_epoch" && "$registration_epoch" =~ ^[0-9]+$ && "$epoch" -lt "$registration_epoch" ]] && continue
             amount=${epoch_amounts[$epoch]:-0}
             amount=$(awk "BEGIN {printf \"%.1f\", $amount/100000000000}")
-            validator_blocks="${epoch_blocks[$epoch]}"
-            validator_credits_value="0"
-            if [[ -n "${epoch_block_reward_L2[$epoch]}" && "${epoch_block_reward_L2[$epoch]}" != "0" && -n "$validator_blocks" && "$validator_blocks" -gt 0 ]]; then
-                validator_credits_value=$(echo "scale=8; $validator_blocks * ${epoch_block_reward_L2[$epoch]}" | bc)
-            fi
-            epochs_json=$(jq --arg e "$epoch" --arg b "${epoch_blocks[$epoch]}" --arg a "$amount" --arg vcv "$validator_credits_value" '. += [{"epoch": $e | tonumber, "blocks": $b | tonumber, "withdrawal": $a | tonumber, "validator_credits_value": (if $vcv == "" then "0" else $vcv | tonumber end)}]' <<< "$epochs_json")
+            epochs_json=$(jq --arg e "$epoch" --arg b "${epoch_blocks[$epoch]}" --arg a "$amount" '. += [{"epoch": $e | tonumber, "blocks": $b | tonumber, "withdrawal": $a | tonumber}]' <<< "$epochs_json")
         done
         for epoch in "${!epoch_amounts[@]}"; do
             [[ ! "$epoch" =~ ^[0-9]+$ || $epoch -eq 0 ]] && continue
             [[ -n "$registration_epoch" && "$registration_epoch" =~ ^[0-9]+$ && "$epoch" -lt "$registration_epoch" ]] && continue
             [[ -z "${epoch_blocks[$epoch]}" ]] || continue
             amount=$(awk "BEGIN {printf \"%.1f\", ${epoch_amounts[$epoch]}/100000000000}")
-            epochs_json=$(jq --arg e "$epoch" --arg a "$amount" '. += [{"epoch": $e | tonumber, "blocks": 0, "withdrawal": $a | tonumber, "validator_credits_value": 0}]' <<< "$epochs_json")
+            epochs_json=$(jq --arg e "$epoch" --arg a "$amount" '. += [{"epoch": $e | tonumber, "blocks": 0, "withdrawal": $a | tonumber}]' <<< "$epochs_json")
         done
-        epochs_json=$(jq 'sort_by(.epoch)' <<< "$epochs_json")
+        epochs_json=$(jq 'map({epoch, blocks, withdrawal}) | sort_by(.epoch)' <<< "$epochs_json")
         if [[ $fixed_epoch_max -ge 1 ]]; then
             cached_part=$(echo "$epochs_json" | jq --argjson m "$fixed_epoch_max" '[.[] | select(.epoch <= $m)]')
             echo "$cached_part" > "$withdrawals_cache_file"
         fi
     fi
-    epochs_json=$(echo "$epochs_json" | jq --argjson rewards "$REWARDS_JSON" 'map(. + {"validator_credits_value": (if .blocks != null and (.blocks > 0) then ((.blocks * (($rewards[.epoch|tostring] // 0) | tonumber)) * 100000000 | round | . / 100000000) else 0 end)})')
+    epochs_json=$(echo "$epochs_json" | jq 'map({epoch, blocks, withdrawal})')
     epochs_json_compact=$(echo "$epochs_json" | jq -c '.')
     local validator_fragment
     validator_fragment=$(jq -c -n --arg hash "$validator_hash" --arg ip "$service" --arg identity "$identity" --arg registration_epoch "$registration_epoch" --arg identityBalance "$identityBalance" --arg rating "$rating" --argjson withdrawals "$epochs_json_compact" '{($hash): { "IP": $ip, "identity": $identity, "identityBalance": $identityBalance, "registration_epoch": (if $registration_epoch == "" then null else ($registration_epoch | tonumber) end), "rating": ($rating | tonumber), "withdrawals": $withdrawals }}')
     echo "$validator_fragment" > "$out_file"
 }
 
-# Воркеры для --incremental-v1 (параллель по PARALLEL_JOBS). Глобальные: VALIDATORS, REWARDS_JSON, EPOCH_*.
+# Воркеры для --incremental-v1 (параллель по PARALLEL_JOBS). Глобальные: VALIDATORS, EPOCH_*.
 incremental_v1_blocks_worker() {
     local i="$1" json_file="$2" curEpoch="$3" bounds_file="$4" out_dir="$5"
     local h tmpf ceb fb lb
@@ -1581,7 +1571,7 @@ incremental_v1_blocks_worker() {
 
 incremental_v1_patch_worker() {
     local i="$1" json_file="$2" curEpoch="$3" rating="$4" ceb="$5" out_dir="$6"
-    local h identity identityBalance response wresp _wurl wd_raw wd one_row epochs_with_credits vcv_epoch
+    local h identity identityBalance response wresp _wurl wd_raw wd
     local timestamp amount unix_time nEpoch idx2
     h="${VALIDATORS[$i]}"
     if ! jq -e --arg xx "$h" '.validators[$xx]' "$json_file" >/dev/null 2>&1; then
@@ -1625,9 +1615,6 @@ incremental_v1_patch_worker() {
 
     wd_raw=${epoch_amounts[$curEpoch]:-0}
     wd=$(LC_NUMERIC=C awk "BEGIN {printf \"%.1f\", ${wd_raw}/100000000000}")
-    one_row=$(jq -n --argjson epoch "$curEpoch" --argjson blocks "$ceb" '[{epoch: $epoch, blocks: $blocks}]')
-    epochs_with_credits=$(echo "$one_row" | jq --argjson rewards "$REWARDS_JSON" 'map(. + {"validator_credits_value": (if .blocks != null and (.blocks > 0) then ((.blocks * (($rewards[.epoch|tostring] // 0) | tonumber)) * 100000000 | round | . / 100000000) else 0 end)})')
-    vcv_epoch=$(echo "$epochs_with_credits" | jq -c '(.[0].validator_credits_value // 0)')
     unset epoch_amounts
 
     jq -nc \
@@ -1637,8 +1624,7 @@ incremental_v1_patch_worker() {
         --argjson ce "$curEpoch" \
         --argjson blocks "$ceb" \
         --argjson wd "$wd" \
-        --argjson vcv "$vcv_epoch" \
-        '{h:$h, ib:$ib, rating:$rating, ce:$ce, blocks:$blocks, wd:$wd, vcv:$vcv}' >"${out_dir}/patch_${i}.ndjson"
+        '{h:$h, ib:$ib, rating:$rating, ce:$ce, blocks:$blocks, wd:$wd}' >"${out_dir}/patch_${i}.ndjson"
 }
 
 # При той же эпохе: без rebuild_arrays / полного generate_json_db — только поля,
@@ -1685,32 +1671,6 @@ incremental_v1_run() {
         EPOCH_START+=("$startTime")
         EPOCH_END+=("$endTime")
     done < "$SAVE_DIR/epoch_intervals.txt"
-
-    declare -A epoch_blocks_count_L1 epoch_blocks_count_L2 epoch_total_reward epoch_block_reward_L2
-    while IFS=':' read -r epoch blocks; do [[ -n "$epoch" && -n "$blocks" ]] && epoch_blocks_count_L1[$epoch]="$blocks"; done < "$EPOCH_BLOCKS_COUNT_L1_FILE"
-    while IFS=':' read -r epoch blocks; do [[ -n "$epoch" && -n "$blocks" ]] && epoch_blocks_count_L2[$epoch]="$blocks"; done < "$EPOCH_BLOCKS_COUNT_L2_FILE"
-    for epoch in "${!epoch_blocks_count_L1[@]}"; do
-        total_reward=$(echo "scale=8; ${epoch_blocks_count_L1[$epoch]} * $BLOCK_REWARD_L1" | bc)
-        epoch_total_reward[$epoch]="$total_reward"
-        if [[ -n "${epoch_blocks_count_L2[$epoch]}" && "${epoch_blocks_count_L2[$epoch]}" -gt 0 ]]; then
-            block_reward_L2=$(echo "scale=8; $total_reward / ${epoch_blocks_count_L2[$epoch]}" | bc)
-            epoch_block_reward_L2[$epoch]="$block_reward_L2"
-        else
-            epoch_block_reward_L2[$epoch]="0"
-        fi
-    done
-    local rewards_pairs=()
-    for e in "${!epoch_block_reward_L2[@]}"; do
-        val="${epoch_block_reward_L2[$e]}"
-        val="${val//[$'\n\r']}"
-        [[ -z "$val" ]] && val="0"
-        rewards_pairs+=("\"$e\":$val")
-    done
-    if [[ ${#rewards_pairs[@]} -eq 0 ]]; then
-        REWARDS_JSON="{}"
-    else
-        REWARDS_JSON="{"$(IFS=,; echo "${rewards_pairs[*]}")"}"
-    fi
 
     total=${#VALIDATORS[@]}
     if (( total <= 0 )); then
@@ -1798,9 +1758,9 @@ incremental_v1_run() {
                 | .validators[$p.h].withdrawals |= (
                     ($p.ce) as $ce
                     | if any(.[]; .epoch == $ce) then
-                        map(if .epoch == $ce then {epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd, validator_credits_value: $p.vcv} else . end)
+                        map(if .epoch == $ce then {epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
                       else
-                        . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd, validator_credits_value: $p.vcv}] | sort_by(.epoch)
+                        . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
                       end
                     )
             end
@@ -1858,30 +1818,13 @@ generate_json_db() {
         '{ "current_epoch": (($current_epoch | tonumber) // 0), "epoch_timestamps": { "current_epoch_start": (if $current_start_ts == "" then null else ($current_start_ts | tonumber) end), "current_epoch_end": (if $current_end_ts == "" then null else ($current_end_ts | tonumber) end), "next_epoch_start": (if $next_start_ts == "" then null else ($next_start_ts | tonumber) end) }, "epochs": {}, "validators": {} }')
     sorted_epochs=($(printf '%s\n' "${!epoch_blocks_count_L1[@]}" | sort -n))
     for epoch in "${sorted_epochs[@]}"; do
-        json_data=$(jq --arg e "$epoch" --arg tb_L1 "${epoch_blocks_count_L1[$epoch]}" --arg tb_L2 "${epoch_blocks_count_L2[$epoch]}" --arg tr "${epoch_total_reward[$epoch]}" --arg br_L2 "${epoch_block_reward_L2[$epoch]}" '.epochs += {($e): { "total_epoch_blocks_L1": $tb_L1 | tonumber, "total_epoch_blocks_L2": (if $tb_L2 == "" then null else $tb_L2 | tonumber end), "total_epoch_reward": $tr | tonumber, "block_reward_L2": $br_L2 | tonumber }}' <<< "$json_data")
+        json_data=$(jq --arg e "$epoch" --arg br_L2 "${epoch_block_reward_L2[$epoch]}" '.epochs += {($e): { "block_reward_L2": $br_L2 | tonumber }}' <<< "$json_data")
     done
     for epoch in "${!epoch_blocks_count_L2[@]}"; do
         if [[ -z "${epoch_blocks_count_L1[$epoch]}" ]]; then
-            json_data=$(jq --arg e "$epoch" --arg tb_L2 "${epoch_blocks_count_L2[$epoch]}" '.epochs += {($e): { "total_epoch_blocks_L1": null, "total_epoch_blocks_L2": $tb_L2 | tonumber, "total_epoch_reward": null, "block_reward_L2": null }}' <<< "$json_data")
+            json_data=$(jq --arg e "$epoch" '.epochs += {($e): { "block_reward_L2": null }}' <<< "$json_data")
         fi
     done
-    # JSON для пересчёта validator_credits_value (кэш мог быть записан с нулями)
-    rewards_pairs=()
-    for e in "${!epoch_block_reward_L2[@]}"; do
-        val="${epoch_block_reward_L2[$e]}"
-        val="${val//[$'\n\r']}"
-        [[ -z "$val" ]] && val="0"
-        rewards_pairs+=("\"$e\":$val")
-    done
-    if [[ ${#rewards_pairs[@]} -eq 0 ]]; then
-        REWARDS_JSON="{}"
-    else
-        REWARDS_JSON="{"$(IFS=,; echo "${rewards_pairs[*]}")"}"
-    fi
-    if [[ -n "${DEBUG_VALIDATOR_CREDITS:-}" ]]; then
-        echo "  [DEBUG_VALIDATOR_CREDITS] Эпох в REWARDS_JSON (block_reward_L2): ${#rewards_pairs[@]}" >&2
-        echo "$REWARDS_JSON" | jq -r 'to_entries | .[0:3][] | "    эпоха \(.key): block_reward_L2=\(.value)"' 2>/dev/null || true
-    fi
     # Интервалы эпох — загружаем один раз (раньше timestamp_to_epoch читал файл на каждый withdrawal = минуты на валидатора)
     EPOCH_NUM=()
     EPOCH_START=()
