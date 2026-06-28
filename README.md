@@ -4,6 +4,20 @@
 
 Локальная копия — каталог **`~/Projects/platformexp-db-json-bin`** (отдельно от GeoDashboard на 100.254).
 
+## db.json: baseline + live на сайтах (201 / 254)
+
+- **Baseline** `~/db.json` — один раз (или при смене эпохи): `refresh_db_json_baseline.sh mno@161.97.96.43`
+- **Live-patch** каждые ~30 мин: `patch_db_json_live.sh` (только `identityBalance`, `rating`, blocks/withdrawal текущей эпохи)
+- На **96.43**: `run_db_json_epoch_watch.sh` — полный generate только при смене эпохи (`SKIP_TRANSFER=1`, без SCP на сайты)
+
+Подробно: **`evowatch-server-git/bin/DB_JSON_LIVE_BASELINE.md`**
+
+Заливка на сайты:
+
+```bash
+./push_patch_db_json_live.sh mno@46.19.66.201 mno@161.97.100.254
+```
+
 ## Заливка на 96.43 (с Mac)
 
 ```bash
