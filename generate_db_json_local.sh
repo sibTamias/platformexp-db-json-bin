@@ -92,10 +92,13 @@ while [[ $# -gt 0 ]]; do
               Перед первым --test один раз запустите скрипт без --test или скопируйте список.
 
   --incremental-v1
-              Быстрый режим: не rebuild_arrays / generate_json_db. Берёт готовый db.json
-              и обновляет identityBalance, rating, blocks/withdrawal текущей эпохи.
-              При смене эпохи — только метаданные (current_epoch, timestamps, bounds),
-              без пересборки истории валидаторов.
+              Быстрый режим при неизменной эпохе: не выполнять rebuild_arrays и полный
+              generate_json_db. Нужны готовые $SAVE_DIR/db.json (current_epoch = API),
+              tmp/epoch_bounds.txt, epoch_intervals.txt, epoch_blocks_count_L1/L2.txt после
+              полного прогона. Обновляет по каждому валидатору: identityBalance, rating,
+              строку withdrawals для текущей эпохи (blocks, withdrawal).
+              Скорость: две фазы идут параллельно батчами по PARALLEL_JOBS (как rebuild_arrays);
+              при PARALLEL_JOBS=1 будет очень долго на сотнях валидаторов.
 
   --fresh-logs Совместимость: diag/recover обнуляются при каждом запуске (см. DB_JSON_KEEP_DIAG=1).
 
@@ -710,11 +713,7 @@ arrayValidators() {
         <<< "$all_protx_list_registered" > "$SAVE_DIR/proTxEvoNodeAll.txt"
 }
 
-if [[ "$INCREMENTAL_V1" -eq 1 ]]; then
-    echo "[incremental-v1] пропуск arrayValidators (baseline db.json; proTx — перед transfer при необходимости)."
-else
-    arrayValidators
-fi
+arrayValidators
 
 platform_validators_list() {
     mkdir -p "$SAVE_DIR"
@@ -827,9 +826,6 @@ elif [[ -f "$PLATFORM_VALIDATORS_LIST_FILE" && -s "$PLATFORM_VALIDATORS_LIST_FIL
         VALIDATORS=("${VALIDATORS[@]:0:LIMIT_VALIDATORS}")
         echo "Ограничено до ${#VALIDATORS[@]} валидаторов (LIMIT_VALIDATORS=$LIMIT_VALIDATORS)"
     fi
-elif [[ "$INCREMENTAL_V1" -eq 1 && -f "$JSON_FILE" ]]; then
-    mapfile -t VALIDATORS < <(jq -r '.validators | keys[]' "$JSON_FILE" | tr '[:upper:]' '[:lower:]')
-    echo "[incremental-v1] ${#VALIDATORS[@]} валидаторов из ключей $JSON_FILE"
 else
     echo "Файл валидаторов пуст или не существует. Задай VALIDATOR_HASH=... для одного валидатора."
     exit 1
@@ -1405,38 +1401,10 @@ get_existing_epochs() {
     [[ -f "$1" ]] && awk '{print $2}' "$1" | tr -d ':' | sort -n | uniq || echo ""
 }
 
-# Файл интервалов эпох (кэш). incremental-v1: только догрузка новых эпох, без полного прогона.
+# Файл интервалов эпох (кэш). При очистке кэша удалять и его: rm -f "$SAVE_DIR/epoch_intervals.txt"
+# Формируется один раз за запуск: одна строка на эпоху 1..curEpoch, при повторном формировании старый файл перезаписывается (>).
 epoch_intervals_file="$SAVE_DIR/epoch_intervals.txt"
 curEpoch_global=$(get_cur_epoch_from_status) || exit 1
-
-incremental_v1_sync_epoch_intervals() {
-    local curEpoch=$1
-    local f="$SAVE_DIR/epoch_intervals.txt"
-    local last e
-    mkdir -p "$SAVE_DIR"
-    if [[ ! -f "$f" || ! -s "$f" ]]; then
-        echo "[incremental-v1] создание $f (эпохи 1..$curEpoch)"
-        > "$f"
-        for e in $(seq 1 "$curEpoch"); do
-            fetch_epoch_line "$e" >> "$f"
-        done
-        return 0
-    fi
-    last=$(get_existing_epochs "$f" | tail -1)
-    if [[ -z "$last" || ! "$last" =~ ^[0-9]+$ ]]; then
-        last=0
-    fi
-    if (( curEpoch > last )); then
-        echo "[incremental-v1] догрузка интервалов эпох $((last + 1))..$curEpoch -> $f"
-        for ((e = last + 1; e <= curEpoch; e++)); do
-            fetch_epoch_line "$e" >> "$f"
-        done
-    fi
-}
-
-if [[ "$INCREMENTAL_V1" -eq 1 ]]; then
-    incremental_v1_sync_epoch_intervals "$curEpoch_global"
-else
 need_rebuild=0
 if [[ ! -f "$epoch_intervals_file" ]] || [[ $(get_existing_epochs "$epoch_intervals_file" | wc -l) -eq 0 ]]; then
     need_rebuild=1
@@ -1455,7 +1423,6 @@ if [[ $need_rebuild -eq 1 ]]; then
     for epoch in $(seq 1 "$curEpoch_global"); do
         fetch_epoch_line "$epoch" >> "$epoch_intervals_file"
     done
-fi
 fi
 
 ################################################################################
@@ -1660,120 +1627,6 @@ incremental_v1_patch_worker() {
         '{h:$h, ib:$ib, rating:$rating, ce:$ce, blocks:$blocks, wd:$wd}' >"${out_dir}/patch_${i}.ndjson"
 }
 
-# Лёгкое обновление epoch_bounds.txt (как в rebuild_arrays, без цикла по валидаторам).
-incremental_v1_refresh_epoch_bounds_file() {
-    local curEpoch=$1
-    local bounds_file="$SAVE_DIR/tmp/epoch_bounds.txt"
-    declare -A epoch_first_blocks epoch_last_blocks
-    local epoch epoch_data next_epoch_data st_body bh
-    mkdir -p "$SAVE_DIR/tmp"
-    for epoch in $(seq 0 "$curEpoch"); do
-        epoch_data=$(get_epoch_data "$epoch")
-        epoch_first_blocks[$epoch]=$(get_epoch_first_block_height "$epoch_data")
-        if [[ $epoch -eq $curEpoch ]]; then
-            st_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$PLATFORM_EXPLORER_URL/status")
-            bh=$(echo "$st_body" | jq -r '.api.block.height // empty')
-            epoch_last_blocks[$epoch]="$bh"
-        else
-            next_epoch_data=$(get_epoch_data $((epoch + 1)))
-            epoch_last_blocks[$epoch]=$(get_epoch_first_block_height "$next_epoch_data")
-        fi
-    done
-    > "$bounds_file"
-    for epoch in $(seq 0 "$curEpoch"); do
-        echo "${epoch}:${epoch_first_blocks[$epoch]}:${epoch_last_blocks[$epoch]}" >> "$bounds_file"
-    done
-    echo "  [incremental-v1] epoch_bounds -> $bounds_file (эпохи 0..$curEpoch)"
-}
-
-# Корень db.json: current_epoch, epoch_timestamps, block_reward_L2 текущей эпохи.
-incremental_v1_update_db_root() {
-    local json_file="$1"
-    local curEpoch=$2
-    local current_epoch_data next_epoch_data
-    local current_start_time current_end_time next_epoch_start_timestamp
-    local br_L2 merged_out
-    current_epoch_data=$(get_epoch_data "$curEpoch")
-    current_start_time=$(echo "$current_epoch_data" | jq -r '.epoch.startTime // empty')
-    current_end_time=$(echo "$current_epoch_data" | jq -r '.epoch.endTime // empty')
-    if [[ "$current_end_time" == "null" || -z "$current_end_time" ]]; then
-        current_end_time=$(echo "$current_epoch_data" | jq -r '.nextEpoch.startTime // empty')
-    fi
-    if [[ "$current_end_time" == "null" || -z "$current_end_time" ]]; then
-        next_epoch_data=$(get_epoch_data $((curEpoch + 1)))
-        current_end_time=$(echo "$next_epoch_data" | jq -r '.epoch.startTime // empty')
-    fi
-    next_epoch_start_timestamp=""
-    [[ -n "$current_end_time" && "$current_end_time" =~ ^[0-9]+$ ]] && next_epoch_start_timestamp=$((current_end_time + 1))
-    br_L2=""
-    if [[ -f "$EPOCH_BLOCKS_COUNT_L1_FILE" && -f "$EPOCH_BLOCKS_COUNT_L2_FILE" ]]; then
-        local l1 l2
-        l1=$(awk -F: -v e="$curEpoch" '$1==e{print $2; exit}' "$EPOCH_BLOCKS_COUNT_L1_FILE")
-        l2=$(awk -F: -v e="$curEpoch" '$1==e{print $2; exit}' "$EPOCH_BLOCKS_COUNT_L2_FILE")
-        if [[ -n "$l1" && -n "$l2" && "$l2" -gt 0 ]]; then
-            br_L2=$(echo "scale=8; $l1 * $BLOCK_REWARD_L1 / $l2" | bc)
-        fi
-    fi
-    merged_out=$(mktemp)
-    if [[ -n "$br_L2" ]]; then
-        jq \
-            --argjson ce "$curEpoch" \
-            --arg cst "$current_start_time" \
-            --arg cet "$current_end_time" \
-            --arg nest "$next_epoch_start_timestamp" \
-            --arg br "$br_L2" \
-            --arg es "$curEpoch" \
-            '.current_epoch = $ce
-            | .epoch_timestamps = {
-                current_epoch_start: (if $cst == "" then null else ($cst | tonumber) end),
-                current_epoch_end: (if $cet == "" then null else ($cet | tonumber) end),
-                next_epoch_start: (if $nest == "" then null else ($nest | tonumber) end)
-              }
-            | .epochs[$es] = { block_reward_L2: ($br | tonumber) }' \
-            "$json_file" >"$merged_out"
-    else
-        jq \
-            --argjson ce "$curEpoch" \
-            --arg cst "$current_start_time" \
-            --arg cet "$current_end_time" \
-            --arg nest "$next_epoch_start_timestamp" \
-            '.current_epoch = $ce
-            | .epoch_timestamps = {
-                current_epoch_start: (if $cst == "" then null else ($cst | tonumber) end),
-                current_epoch_end: (if $cet == "" then null else ($cet | tonumber) end),
-                next_epoch_start: (if $nest == "" then null else ($nest | tonumber) end)
-              }' \
-            "$json_file" >"$merged_out"
-    fi
-    mv "$merged_out" "$json_file"
-}
-
-# Смена эпохи без полного прогона: L1/L2 counts, bounds, корень db.json, интервалы.
-incremental_v1_on_epoch_change() {
-    local json_file="$1" db_epoch="$2" curEpoch="$3"
-    echo "  [incremental-v1] смена эпохи $db_epoch -> $curEpoch (patch baseline, без rebuild_arrays)"
-    calculate_epoch_blocks_count_L1 "$curEpoch"
-    calculate_epoch_blocks_count_L2 "$curEpoch"
-    incremental_v1_sync_epoch_intervals "$curEpoch"
-    incremental_v1_refresh_epoch_bounds_file "$curEpoch"
-    incremental_v1_update_db_root "$json_file" "$curEpoch"
-}
-
-incremental_v1_ensure_sidecar_files() {
-    local json_file="$1" curEpoch="$2"
-    if [[ ! -f "$EPOCH_BLOCKS_COUNT_L1_FILE" || ! -f "$EPOCH_BLOCKS_COUNT_L2_FILE" ]]; then
-        echo "  [incremental-v1] создание epoch_blocks_count_L1/L2 (лёгкий расчёт)"
-        calculate_epoch_blocks_count_L1 "$curEpoch"
-        calculate_epoch_blocks_count_L2 "$curEpoch"
-    fi
-    if [[ ! -f "$SAVE_DIR/epoch_intervals.txt" ]]; then
-        incremental_v1_sync_epoch_intervals "$curEpoch"
-    fi
-    if [[ ! -f "$SAVE_DIR/tmp/epoch_bounds.txt" ]]; then
-        incremental_v1_refresh_epoch_bounds_file "$curEpoch"
-    fi
-}
-
 # При той же эпохе: без rebuild_arrays / полного generate_json_db — только поля,
 # которые меняются в течение эпохи (см. --incremental-v1 в справке).
 incremental_v1_run() {
@@ -1787,7 +1640,13 @@ incremental_v1_run() {
     json_file="$SAVE_DIR/db.json"
     bounds_file="$SAVE_DIR/tmp/epoch_bounds.txt"
 
-    [[ -f "$json_file" ]] || { echo "ОШИБКА [incremental-v1]: нет baseline $json_file — положите готовый db.json." >&2; return 1; }
+    [[ -f "$json_file" ]] || { echo "ОШИБКА [incremental-v1]: нет $json_file (нужен полный прогон)." >&2; return 1; }
+    [[ -f "$bounds_file" ]] || { echo "ОШИБКА [incremental-v1]: нет $bounds_file (нужен полный rebuild_arrays)." >&2; return 1; }
+    [[ -f "$SAVE_DIR/epoch_intervals.txt" ]] || { echo "ОШИБКА [incremental-v1]: нет $SAVE_DIR/epoch_intervals.txt." >&2; return 1; }
+    [[ -f "$EPOCH_BLOCKS_COUNT_L1_FILE" && -f "$EPOCH_BLOCKS_COUNT_L2_FILE" ]] || {
+        echo "ОШИБКА [incremental-v1]: нужны $EPOCH_BLOCKS_COUNT_L1_FILE и $EPOCH_BLOCKS_COUNT_L2_FILE." >&2
+        return 1
+    }
 
     curEpoch=$(get_cur_epoch_from_status) || return 1
     db_epoch=$(jq -r '.current_epoch // empty' "$json_file")
@@ -1795,13 +1654,9 @@ incremental_v1_run() {
         echo "ОШИБКА [incremental-v1]: в db.json нет .current_epoch." >&2
         return 1
     fi
-
-    incremental_v1_ensure_sidecar_files "$json_file" "$curEpoch"
-
     if [[ "$db_epoch" != "$curEpoch" ]]; then
-        incremental_v1_on_epoch_change "$json_file" "$db_epoch" "$curEpoch" || return 1
-    else
-        incremental_v1_refresh_epoch_bounds_file "$curEpoch"
+        echo "ОШИБКА [incremental-v1]: current_epoch в db.json=$db_epoch, в API=$curEpoch — сделайте полный прогон без --incremental-v1." >&2
+        return 1
     fi
 
     EPOCH_NUM=()

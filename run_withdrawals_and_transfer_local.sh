@@ -1,98 +1,39 @@
 #!/bin/bash
-# run_withdrawals_and_transfer_local.sh — cron на platformExp (96.43).
+# run_withdrawals_and_transfer_local.sh
 #
-# Всегда patch поверх готового db.json (--incremental-v1):
-#   identityBalance, rating, blocks/withdrawal текущей эпохи.
-# Полный rebuild_arrays / generate_json_db не вызывается.
-#
-# Переменные (.env): SAVE_DIR, PLATFORM_EXPLORER_URL, SKIP_TRANSFER
-#
-# Исключения:
-#   --test [N]  — передать в generate_db_json_local.sh как есть
-#   DB_JSON_FORCE_FULL=1 — только для ручного аварийного полного прогона
+# Запуск формирования db.json с ЛОКАЛЬНЫМ platform-explorer (localhost:3005),
+# затем отправка на целевой сервер (если нужен transfer).
 #
 export TZ=Asia/Irkutsk
 
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ -r "$BIN/.env" ]] && source "$BIN/.env"
 
-SAVE_DIR="${SAVE_DIR:-/home/mno/tmp/withdrawals}"
-DB_JSON="${DB_JSON:-$SAVE_DIR/db.json}"
 LOG_FILE="${LOG_FILE:-/home/mno/tmp/cron.log}"
-
+> "$LOG_FILE"
 start_time=$(date +%s)
-trap 's=$(($(date +%s) - start_time)); m=$((s / 60)); r=$((s % 60)); echo "[$(date +"%a %d %b %Y %H:%M:%S %Z")] Execution time: ${m} min ${r} sec (wrapper)" >> "$LOG_FILE"' EXIT
+trap 's=$(($(date +%s) - start_time)); m=$((s / 60)); echo "[$(date +"%a %d %b %Y %H:%M:%S %Z")] Execution time: ${m} min" >> "$LOG_FILE"' EXIT
 
-log() {
-    echo "[$(TZ=Asia/Irkutsk date +'%a %d %b %Y %H:%M:%S IRKT')] $*" | tee -a "$LOG_FILE"
-}
+echo "[$(TZ=Asia/Irkutsk date +'%a %d %b %Y %H:%M:%S IRKT')] Starting run_withdrawals_and_transfer_local.sh $*" >> "$LOG_FILE"
 
-{
-    echo ""
-    echo "========== run_withdrawals_and_transfer_local.sh $* =========="
-} >> "$LOG_FILE"
-
-log "Starting run_withdrawals_and_transfer_local.sh $*"
-
-if [[ ! -f "$DB_JSON" ]]; then
-    log "ERROR: нет baseline db.json ($DB_JSON) — положите готовый файл, полный прогон отключён"
-    exit 1
-fi
-
-gen_args=()
-if [[ "${DB_JSON_FORCE_FULL:-0}" == "1" ]]; then
-    log "WARN: DB_JSON_FORCE_FULL=1 — ручной полный прогон"
-    gen_args=("$@")
-elif [[ $# -gt 0 ]]; then
-    case "$1" in
-        --test*)
-            log "Режим: --test (явные аргументы)"
-            gen_args=("$@")
-            ;;
-        --incremental-v1)
-            log "Режим: --incremental-v1 (явно)"
-            gen_args=("$@")
-            ;;
-        *)
-            log "Режим: --incremental-v1 + extra args: $*"
-            gen_args=(--incremental-v1 "$@")
-            ;;
-    esac
+echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] Running generate_db_json_local.sh $*" >> "$LOG_FILE"
+if "$BIN/generate_db_json_local.sh" "$@" >> "$LOG_FILE" 2>&1; then
+    echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] db.json generated successfully" >> "$LOG_FILE"
 else
-    log "Режим: --incremental-v1 (patch готового db.json)"
-    gen_args=(--incremental-v1)
-fi
-
-t_gen=$(date +%s)
-log "Running generate_db_json_local.sh ${gen_args[*]}"
-if "$BIN/generate_db_json_local.sh" "${gen_args[@]}" >> "$LOG_FILE" 2>&1; then
-    log "db.json OK (generate $(( $(date +%s) - t_gen )) sec)"
-else
-    log "ERROR: generate_db_json_local.sh failed"
+    echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] ERROR: generate_db_json_local.sh failed" >> "$LOG_FILE"
     exit 1
 fi
 
 if [[ "${SKIP_TRANSFER:-0}" == "1" ]]; then
-    log "SKIP_TRANSFER=1, transfer skipped"
+    echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] SKIP_TRANSFER=1, transfer skipped" >> "$LOG_FILE"
 else
-    if [[ -x "$BIN/generate_db_json_local.sh" ]] && [[ -r "$BIN/.env" ]]; then
-        # proTxEvoNodeAll.txt для transfer (arrayValidators не вызывается в incremental-v1)
-        DASH_CLI="${DASH_CLI:-dashmate exec dash_core dash-cli}"
-        if $DASH_CLI getblockcount &>/dev/null; then
-            log "Обновление proTxEvoNodeAll.txt перед transfer"
-            $DASH_CLI protx list registered 1 2>/dev/null \
-                | jq -r '.[] | select(.state.PoSeBanHeight == -1 and .type == "Evo") | .proTxHash' \
-                > "${SAVE_DIR}/proTxEvoNodeAll.txt" || true
-        fi
-    fi
-    t_tr=$(date +%s)
-    log "Running transfer_db.sh"
+    echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] Running transfer_db.sh" >> "$LOG_FILE"
     if "$BIN/transfer_db.sh" >> "$LOG_FILE" 2>&1; then
-        log "transfer_db.sh OK ($(( $(date +%s) - t_tr )) sec)"
+        echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] transfer_db.sh completed successfully" >> "$LOG_FILE"
     else
-        log "ERROR: transfer_db.sh failed"
+        echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] ERROR: transfer_db.sh failed" >> "$LOG_FILE"
         exit 2
     fi
 fi
 
-log "All scripts completed"
+echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] All scripts completed" >> "$LOG_FILE"
