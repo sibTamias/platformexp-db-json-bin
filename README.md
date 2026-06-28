@@ -26,18 +26,16 @@
 ./push_patch_db_json_live.sh mno@161.97.96.43
 ```
 
-### Cron (96.43): быстрый patch вместо полной пересборки
+### Cron (96.43): только patch готового db.json
 
-`run_withdrawals_and_transfer_local.sh` при **той же эпохе** вызывает `generate_db_json_local.sh --incremental-v1`:
-обновляются только `identityBalance`, `rating`, `blocks`/`withdrawal` текущей эпохи.
-
-При **смене эпохи** — полный прогон (`rebuild_arrays` + `generate_json_db`).
+`run_withdrawals_and_transfer_local.sh` **всегда** `--incremental-v1` (полный прогон не вызывается).
+Обновляются `identityBalance`, `rating`, blocks/withdrawal текущей эпохи; при смене эпохи — только метаданные.
 
 ```cron
 0 */2 * * * /home/mno/bin/run_withdrawals_and_transfer_local.sh >> /home/mno/tmp/cron.log 2>&1
 ```
 
-Принудительно полный: `DB_JSON_FORCE_FULL=1 ~/bin/run_withdrawals_and_transfer_local.sh`
+Аварийный полный прогон (ручной): `DB_JSON_FORCE_FULL=1 ~/bin/run_withdrawals_and_transfer_local.sh`
 
 ## На сервере без `cp` каждый раз
 
