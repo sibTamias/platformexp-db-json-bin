@@ -17,7 +17,7 @@
 #   DB_JSON=/home/mno/db.json
 #   SAVE_DIR=/home/mno/tmp/withdrawals
 #   PLATFORM_EXPLORER_URL=http://localhost:3005
-#   PLATFORM_EXPLORER_FALLBACK_URL= — опционально, если localhost недоступен
+#   Только localhost — внешний API (pshenmic.dev) не используется.
 #   PARALLEL_JOBS=4
 #   DB_JSON_LIVE_LOG=/home/mno/logs/db_json_live.log
 #   DB_JSON_EPOCH_MISMATCH_LOG=/home/mno/logs/db_json_epoch_mismatch.log
@@ -35,7 +35,11 @@ BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DB_JSON="${DB_JSON:-${DB_JSON_PATH:-$HOME/db.json}}"
 SAVE_DIR="${SAVE_DIR:-$HOME/tmp/withdrawals}"
 PLATFORM_EXPLORER_URL="${PLATFORM_EXPLORER_URL:-http://localhost:3005}"
-PLATFORM_EXPLORER_FALLBACK_URL="${PLATFORM_EXPLORER_FALLBACK_URL:-}"
+# Жёстко localhost — без fallback на внешние API
+if [[ "$PLATFORM_EXPLORER_URL" != http://localhost:* && "$PLATFORM_EXPLORER_URL" != http://127.0.0.1:* ]]; then
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: PLATFORM_EXPLORER_URL must be localhost (got: $PLATFORM_EXPLORER_URL)" | tee -a "${DB_JSON_LIVE_LOG:-$HOME/logs/db_json_live.log}"
+    exit 1
+fi
 LIVE_LOG="${DB_JSON_LIVE_LOG:-$HOME/logs/db_json_live.log}"
 EPOCH_MISMATCH_LOG="${DB_JSON_EPOCH_MISMATCH_LOG:-$HOME/logs/db_json_epoch_mismatch.log}"
 GENERATOR="${DB_JSON_GENERATOR:-$BIN/generate_db_json_local.sh}"
@@ -64,18 +68,10 @@ pe_status_epoch() {
 pick_platform_explorer_url() {
     local epoch
     if epoch=$(pe_status_epoch "$PLATFORM_EXPLORER_URL"); then
-        export PLATFORM_EXPLORER_URL
         log "platform-explorer OK: $PLATFORM_EXPLORER_URL (epoch=$epoch)"
         return 0
     fi
-    if [[ -n "$PLATFORM_EXPLORER_FALLBACK_URL" ]]; then
-        if epoch=$(pe_status_epoch "$PLATFORM_EXPLORER_FALLBACK_URL"); then
-            export PLATFORM_EXPLORER_URL="$PLATFORM_EXPLORER_FALLBACK_URL"
-            log "WARN: localhost недоступен, fallback $PLATFORM_EXPLORER_URL (epoch=$epoch)"
-            return 0
-        fi
-    fi
-    log "ERROR: platform-explorer недоступен ($PLATFORM_EXPLORER_URL)"
+    log "ERROR: локальный platform-explorer недоступен ($PLATFORM_EXPLORER_URL) — нужны dashmate + PE на этом сервере"
     return 1
 }
 
