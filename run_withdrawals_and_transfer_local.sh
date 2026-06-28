@@ -75,6 +75,16 @@ fi
 if [[ "${SKIP_TRANSFER:-0}" == "1" ]]; then
     log "SKIP_TRANSFER=1, transfer skipped"
 else
+    if [[ -x "$BIN/generate_db_json_local.sh" ]] && [[ -r "$BIN/.env" ]]; then
+        # proTxEvoNodeAll.txt для transfer (arrayValidators не вызывается в incremental-v1)
+        DASH_CLI="${DASH_CLI:-dashmate exec dash_core dash-cli}"
+        if $DASH_CLI getblockcount &>/dev/null; then
+            log "Обновление proTxEvoNodeAll.txt перед transfer"
+            $DASH_CLI protx list registered 1 2>/dev/null \
+                | jq -r '.[] | select(.state.PoSeBanHeight == -1 and .type == "Evo") | .proTxHash' \
+                > "${SAVE_DIR}/proTxEvoNodeAll.txt" || true
+        fi
+    fi
     t_tr=$(date +%s)
     log "Running transfer_db.sh"
     if "$BIN/transfer_db.sh" >> "$LOG_FILE" 2>&1; then
