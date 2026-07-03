@@ -19,6 +19,14 @@ echo "[$(TZ=Asia/Irkutsk date +'%a %d %b %Y %H:%M:%S IRKT')] Starting run_withdr
 echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] Running generate_db_json_local.sh $*" >> "$LOG_FILE"
 if "$BIN/generate_db_json_local.sh" "$@" >> "$LOG_FILE" 2>&1; then
     echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] db.json generated successfully" >> "$LOG_FILE"
+    _inc=0
+    for _a in "$@"; do [[ "$_a" == "--incremental-v1" ]] && _inc=1; done
+    if [[ "$_inc" -eq 0 && "${VERSION_SCAN_SKIP:-0}" != "1" && -x "$BIN/scan_node_versions.sh" ]]; then
+        echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] Running scan_node_versions.sh" >> "$LOG_FILE"
+        "$BIN/scan_node_versions.sh" >> "$LOG_FILE" 2>&1 || {
+            echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] WARNING: scan_node_versions.sh failed (db.json без core_version)" >> "$LOG_FILE"
+        }
+    fi
 else
     echo "[$(date +'%a %d %b %Y %H:%M:%S %Z')] ERROR: generate_db_json_local.sh failed" >> "$LOG_FILE"
     exit 1

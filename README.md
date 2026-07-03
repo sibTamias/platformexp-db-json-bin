@@ -37,6 +37,31 @@
 
 Аварийный полный прогон (ручной): `DB_JSON_FORCE_FULL=1 ~/bin/run_withdrawals_and_transfer_local.sh`
 
+## Core version в db.json
+
+После **полного** generate (не `--incremental-v1`) опционально:
+
+```bash
+/home/mno/bin/scan_node_versions.sh
+```
+
+Или автоматически из `run_withdrawals_and_transfer_local.sh` (если не incremental и не `VERSION_SCAN_SKIP=1`).
+
+В каждый `validators[proTx]`: `core_version`, `platform_version`, `version_scanned_at`.  
+В корень: `reference_node` (версия локального dashmate на 96.43).
+
+Cron scan (раз в сутки, если generate только incremental):
+
+```cron
+30 4 * * * /home/mno/bin/scan_node_versions.sh >> /home/mno/logs/node_version_scan.log 2>&1
+```
+
+На сайтах **201/254** — обновление Redis без полного db.json:
+
+```cron
+0 5 * * * /usr/bin/python3 /home/mno/WebMuxValidator/refresh_node_versions_cache.py --workers 12 --force >> /home/mno/logs/node_version_cache.log 2>&1
+```
+
 ## На сервере без `cp` каждый раз
 
 1. Один раз клон и симлинки из репозитория в **`~/bin/`** (рядом кладите **`.env`** — как раньше):
