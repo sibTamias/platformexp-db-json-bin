@@ -8,10 +8,8 @@ set -euo pipefail
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL="$BIN/generate_db_json_local.sh"
 LOCAL_CHECK="$BIN/check_platform_explorer_vs_dashmate.sh"
-LOCAL_SCAN="$BIN/scan_node_versions.sh"
 REMOTE_BIN="${REMOTE_BIN:-/home/mno/bin/generate_db_json_local.sh}"
 REMOTE_CHECK="${REMOTE_CHECK:-/home/mno/bin/check_platform_explorer_vs_dashmate.sh}"
-REMOTE_SCAN="${REMOTE_SCAN:-/home/mno/bin/scan_node_versions.sh}"
 
 usage() {
     echo "Использование: $0 user@host [user@host ...]" >&2
@@ -24,14 +22,12 @@ usage() {
 [[ $# -ge 1 ]] || usage
 [[ -f "$LOCAL" ]] || { echo "Нет файла: $LOCAL" >&2; exit 1; }
 [[ -f "$LOCAL_CHECK" ]] || { echo "Нет файла: $LOCAL_CHECK" >&2; exit 1; }
-[[ -f "$LOCAL_SCAN" ]] || { echo "Нет файла: $LOCAL_SCAN" >&2; exit 1; }
 
 for host in "$@"; do
     echo "=== $host ==="
     ssh "$host" "if [[ -f \"$REMOTE_BIN\" ]]; then cp -p -- \"$REMOTE_BIN\" \"${REMOTE_BIN}.bak\" && echo \"Сохранено: ${REMOTE_BIN}.bak\"; else echo \"Нет $REMOTE_BIN — бэкап пропущен\"; fi"
     scp "$LOCAL" "$host:$REMOTE_BIN"
     scp "$LOCAL_CHECK" "$host:$REMOTE_CHECK"
-    scp "$LOCAL_SCAN" "$host:$REMOTE_SCAN"
-    ssh "$host" "chmod +x \"$REMOTE_BIN\" \"$REMOTE_CHECK\" \"$REMOTE_SCAN\""
-    echo "Готово: $host:$REMOTE_BIN $REMOTE_CHECK $REMOTE_SCAN"
+    ssh "$host" "chmod +x \"$REMOTE_BIN\" \"$REMOTE_CHECK\""
+    echo "Готово: $host:$REMOTE_BIN $REMOTE_CHECK"
 done
