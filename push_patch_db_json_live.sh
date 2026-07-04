@@ -10,6 +10,8 @@ REMOTE_BIN="${REMOTE_BIN:-/home/mno/bin}"
 
 FILES=(
     patch_db_json_live.sh
+    patch_db_json_on_new_block.sh
+    monitor_new_blocks_count.sh
     refresh_db_json_baseline.sh
     run_db_json_epoch_watch.sh
     generate_db_json_local.sh
