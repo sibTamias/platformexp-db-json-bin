@@ -1,0 +1,8 @@
+# ~/bin/transfer_db.conf на platformExp (161.97.96.43)
+# Скопировать: cp transfer_db.conf.example ~/bin/transfer_db.conf
+#
+# evowatch.ru — полный db.json каждые 2 ч (run_withdrawals_and_transfer_local.sh).
+# dashnodes.net (254) — НЕ в списке: там patch_db_json_on_new_block + patch_db_json_live.
+
+TARGET_SERVERS="46.19.66.201"
+REMOTE_USER="mno"

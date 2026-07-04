@@ -4,38 +4,46 @@
 
 Локальная копия — каталог **`~/Projects/platformexp-db-json-bin`** (отдельно от GeoDashboard на 100.254).
 
-## db.json: baseline + live на сайтах (201 / 254)
+## db.json: пилот 254 vs контроль 201
 
-- **Baseline** `~/db.json` — один раз (или при смене эпохи): `refresh_db_json_baseline.sh mno@161.97.96.43`
-- **Live-patch** каждые ~30 мин: `patch_db_json_live.sh` (только `identityBalance`, `rating`, blocks/withdrawal текущей эпохи)
-- На **96.43**: `run_db_json_epoch_watch.sh` — полный generate только при смене эпохи (`SKIP_TRANSFER=1`, без SCP на сайты)
+| Сервер | Схема |
+|--------|--------|
+| **161.97.100.254** dashnodes.net | live-patch локально (`patch_db_json_on_new_block`, `patch_db_json_live`) |
+| **46.19.66.201** evowatch.ru | SCP `db.json` с 96.43 каждые 2 ч |
+| **161.97.96.43** platformExp | полный generate + transfer **только на 201** |
 
 Подробно: **`evowatch-server-git/bin/DB_JSON_LIVE_BASELINE.md`**
 
-Заливка на сайты:
+Заливка live-скриптов на **254**:
 
 ```bash
-./push_patch_db_json_live.sh mno@46.19.66.201 mno@161.97.100.254
+./push_patch_db_json_live.sh mno@161.97.100.254
 ```
 
 ## Заливка на 96.43 (с Mac)
 
 ```bash
 ./push_generate_db_json_local.sh mno@161.97.96.43
-# или полный набор включая run_withdrawals:
 ./push_patch_db_json_live.sh mno@161.97.96.43
 ```
 
-### Cron (96.43): только patch готового db.json
+На 96.43 один раз:
 
-`run_withdrawals_and_transfer_local.sh` **всегда** `--incremental-v1` (полный прогон не вызывается).
-Обновляются `identityBalance`, `rating`, blocks/withdrawal текущей эпохи; при смене эпохи — только метаданные.
+```bash
+cp ~/bin/transfer_db.conf.example ~/bin/transfer_db.conf
+# TARGET_SERVERS="46.19.66.201"  — без 254
+```
+
+### Cron (96.43): generate + transfer на 201
+
+Полный `generate_db_json_local.sh` (без `--incremental-v1`), затем `transfer_db.sh`:
 
 ```cron
+# db.json + transfer every 2 h (201 only; 254 = live-patch locally)
 0 */2 * * * /home/mno/bin/run_withdrawals_and_transfer_local.sh >> /home/mno/tmp/cron.log 2>&1
 ```
 
-Аварийный полный прогон (ручной): `DB_JSON_FORCE_FULL=1 ~/bin/run_withdrawals_and_transfer_local.sh`
+`SKIP_TRANSFER=1` в `.env` **не** ставить, если нужен transfer на 201.
 
 ## На сервере без `cp` каждый раз
 

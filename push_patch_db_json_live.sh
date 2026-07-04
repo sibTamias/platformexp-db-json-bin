@@ -14,6 +14,9 @@ FILES=(
     monitor_new_blocks_count.sh
     refresh_db_json_baseline.sh
     run_db_json_epoch_watch.sh
+    run_withdrawals_and_transfer_local.sh
+    transfer_db.sh
+    transfer_db.conf.example
     generate_db_json_local.sh
     check_platform_explorer_vs_dashmate.sh
 )
