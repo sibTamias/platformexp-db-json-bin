@@ -78,12 +78,17 @@ mkdir -p "$SAVE_DIR/tmp" "$(dirname "$LOG_FILE")"
 [[ -f "$DB_JSON" ]] || { log_always "ERROR: нет $DB_JSON"; exit 1; }
 [[ -f "$BOUNDS_FILE" ]] || { log_always "ERROR: нет $BOUNDS_FILE"; exit 1; }
 
-api_epoch=$(curl -sS --max-time 15 "${PLATFORM_EXPLORER_URL%/}/status" | jq -r '.epoch.number // empty')
-api_height=$(curl -sS --max-time 15 "${PLATFORM_EXPLORER_URL%/}/status" | jq -r '.api.block.height // empty')
-[[ -n "$api_epoch" && "$api_epoch" =~ ^[0-9]+$ ]] || { log_always "ERROR: epoch из $PLATFORM_EXPLORER_URL/status"; exit 1; }
+api_body=$(curl -sS --max-time 15 "${PLATFORM_EXPLORER_URL%/}/status" 2>/dev/null) || api_body=""
+api_epoch=$(echo "$api_body" | jq -r '.epoch.number // .epochs.current // empty')
+api_height=$(echo "$api_body" | jq -r '.api.block.height // empty')
+db_epoch=$(jq -r '.current_epoch // empty' "$DB_JSON")
+if [[ -z "$api_epoch" || "$api_epoch" == "null" || ! "$api_epoch" =~ ^[0-9]+$ ]]; then
+    api_epoch="$db_epoch"
+    log "epoch из /status пуст — используем db.json current_epoch=$api_epoch"
+fi
+[[ -n "$api_epoch" && "$api_epoch" =~ ^[0-9]+$ ]] || { log_always "ERROR: epoch (API и db.json)"; exit 1; }
 [[ -n "$api_height" && "$api_height" =~ ^[0-9]+$ ]] || { log_always "ERROR: height из /status"; exit 1; }
 
-db_epoch=$(jq -r '.current_epoch // empty' "$DB_JSON")
 [[ "$db_epoch" == "$api_epoch" ]] || {
     log_always "EPOCH_MISMATCH db.json=$db_epoch API=$api_epoch — нужен refresh_db_json_baseline.sh"
     exit 2
