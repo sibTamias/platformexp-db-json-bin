@@ -3,6 +3,7 @@
 #
 # Использование на сервере сайта (201/254):
 #   ./refresh_db_json_baseline.sh mno@161.97.96.43
+#   ./refresh_db_json_baseline.sh mno@161.97.96.43 --with-cache --reconcile
 #   ./refresh_db_json_baseline.sh /path/to/db.json   # локальный файл
 #
 # Копирует с platformExp (или из файла):
@@ -12,7 +13,12 @@
 #   ~/tmp/withdrawals/epoch_blocks_count_L1.txt
 #   ~/tmp/withdrawals/epoch_blocks_count_L2.txt
 #   ~/tmp/withdrawals/all_validators_list.txt (если есть)
+#
+#   --with-cache   rsync cache/validators/*_all_blocks.txt с platformExp
+#   --reconcile    после копирования: reconcile_db_json_blocks_from_cache.sh (нужен cache + PE)
 set -euo pipefail
+
+BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REMOTE_USER="${REMOTE_USER:-mno}"
 REMOTE_HOST="${REMOTE_HOST:-161.97.96.43}"
@@ -20,16 +26,32 @@ REMOTE_SAVE="${REMOTE_SAVE:-/home/mno/tmp/withdrawals}"
 LOCAL_DB="${DB_JSON:-$HOME/db.json}"
 LOCAL_SAVE="${SAVE_DIR:-$HOME/tmp/withdrawals}"
 
+WITH_CACHE=0
+DO_RECONCILE=0
+ARGS=()
+
 usage() {
     cat <<'USAGE'
 Использование:
-  refresh_db_json_baseline.sh [user@host]
+  refresh_db_json_baseline.sh [опции] [user@host]
   refresh_db_json_baseline.sh /path/to/db.json
+
+  --with-cache   sync_validator_blocks_cache.sh с platformExp
+  --reconcile    пересчитать blocks текущей эпохи из cache (подразумевает --with-cache при remote)
 
   Без аргументов — SCP с mno@161.97.96.43 (REMOTE_HOST).
 USAGE
     exit 1
 }
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-cache) WITH_CACHE=1; shift ;;
+        --reconcile) DO_RECONCILE=1; WITH_CACHE=1; shift ;;
+        -h|--help) usage ;;
+        *) ARGS+=("$1"); shift ;;
+    esac
+done
 
 copy_from_remote() {
     local host="$1"
@@ -49,6 +71,12 @@ copy_from_remote() {
             echo "  skip $f (нет на источнике)"
         fi
     done
+    if [[ "$WITH_CACHE" -eq 1 ]]; then
+        bash "$BIN/sync_validator_blocks_cache.sh" "$host"
+    fi
+    if [[ "$DO_RECONCILE" -eq 1 ]]; then
+        bash "$BIN/reconcile_db_json_blocks_from_cache.sh"
+    fi
     echo "Готово: $LOCAL_DB + артефакты в $LOCAL_SAVE"
 }
 
@@ -61,14 +89,14 @@ copy_local_file() {
     echo "Артефакты epoch_* скопируйте отдельно или запустите refresh с user@host."
 }
 
-[[ $# -le 1 ]] || usage
+[[ ${#ARGS[@]} -le 1 ]] || usage
 
-if [[ $# -eq 0 ]]; then
+if [[ ${#ARGS[@]} -eq 0 ]]; then
     copy_from_remote "${REMOTE_USER}@${REMOTE_HOST}"
-elif [[ -f "$1" ]]; then
-    copy_local_file "$1"
-elif [[ "$1" == *@* ]]; then
-    copy_from_remote "$1"
+elif [[ -f "${ARGS[0]}" ]]; then
+    copy_local_file "${ARGS[0]}"
+elif [[ "${ARGS[0]}" == *@* ]]; then
+    copy_from_remote "${ARGS[0]}"
 else
     usage
 fi

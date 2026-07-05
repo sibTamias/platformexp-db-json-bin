@@ -19,6 +19,8 @@ set -euo pipefail
 export TZ=Asia/Irkutsk
 
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib_db_json_blocks.sh
+source "$BIN/lib_db_json_blocks.sh"
 [[ -r "${BIN_DIR:-$HOME/bin}/.env" ]] && source "${BIN_DIR:-$HOME/bin}/.env"
 [[ -r "$BIN/.env" ]] && source "$BIN/.env"
 
@@ -148,51 +150,6 @@ patch_one_block() {
     mv -f "$tmp" "$db"
 }
 
-# Рейтинг по blocks текущей эпохи (как incremental-v1).
-recalc_ratings() {
-    local db="$1" epoch="$2"
-    local tmp list rating prev_blocks prev_rating blocks key
-    tmp=$(mktemp "${db}.rating.XXXXXX")
-    list=$(mktemp)
-    jq -r --argjson ce "$epoch" '
-        .validators | to_entries[] |
-        ((.value.withdrawals // []) | map(select(.epoch == $ce)) | if length > 0 then .[0].blocks else 0 end) as $b |
-        "\($b)\t\(.key)"
-    ' "$db" | sort -t$'\t' -k1,1nr -k2,2 >"$list"
-
-    rating=1
-    prev_blocks=-1
-    prev_rating=1
-    declare -A rating_map=()
-    while IFS=$'\t' read -r blocks key; do
-        if [[ "$blocks" != "$prev_blocks" ]]; then
-            if [[ "$prev_blocks" -ne -1 ]]; then
-                rating=$((prev_rating + 1))
-            fi
-            prev_rating=$rating
-            prev_blocks=$blocks
-        fi
-        rating_map[$key]=$rating
-    done <"$list"
-    rm -f "$list"
-
-    {
-        echo -n '{'
-        first=1
-        for key in "${!rating_map[@]}"; do
-            [[ $first -eq 1 ]] && first=0 || echo -n ','
-            printf '"%s":%s' "$key" "${rating_map[$key]}"
-        done
-        echo '}'
-    } >"${tmp}.ratings.json"
-
-    jq --slurpfile r "${tmp}.ratings.json" '
-        .validators |= with_entries(.value.rating = ($r[0][.key] // 999999))
-    ' "$db" >"$tmp"
-    rm -f "${tmp}.ratings.json"
-    mv -f "$tmp" "$db"
-}
-
 run_once() {
     local cur last next h_min h_max page blocks_json n gap max_fetch updates
     local ht vt cur_epoch db_epoch
@@ -245,6 +202,7 @@ run_once() {
             else
                 if jq -e --arg h "$vt" '.validators[$h]' "$DB_JSON" >/dev/null 2>&1; then
                     patch_one_block "$DB_JSON" "$vt" "$cur_epoch" "$ht"
+                    append_validator_block_cache "$vt" "$ht" || true
                     log "+1 epoch=$cur_epoch height=$ht proposer=${vt:0:16}…"
                 else
                     log "WARN: proposer $vt не в db.json (height=$ht) — пропуск"
@@ -258,7 +216,7 @@ run_once() {
     done
 
     if [[ "$updates" -gt 0 && "$DRY_RUN" -eq 0 ]]; then
-        recalc_ratings "$DB_JSON" "$cur_epoch"
+        recalc_ratings_db_json "$DB_JSON" "$cur_epoch"
         log "пересчитан rating для epoch=$cur_epoch"
     fi
 
