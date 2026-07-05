@@ -72,7 +72,13 @@ copy_from_remote() {
         fi
     done
     if [[ "$WITH_CACHE" -eq 1 ]]; then
-        bash "$BIN/sync_validator_blocks_cache.sh" "$host"
+        if ! bash "$BIN/sync_validator_blocks_cache.sh" "$host"; then
+            echo "WARN: sync cache с $host не удался (ssh refused?). Варианты:" >&2
+            echo "  1) повторить: ~/bin/sync_validator_blocks_cache.sh $host" >&2
+            echo "  2) с 96.43 push: ssh mno@161.97.96.43 '~/bin/sync_validator_blocks_cache.sh --push mno@161.97.100.254'" >&2
+            [[ "$DO_RECONCILE" -eq 1 ]] && echo "  reconcile пропущен — нужен актуальный cache" >&2
+            DO_RECONCILE=0
+        fi
     fi
     if [[ "$DO_RECONCILE" -eq 1 ]]; then
         bash "$BIN/reconcile_db_json_blocks_from_cache.sh"
