@@ -17,6 +17,7 @@ FILES=(
     run_withdrawals_and_transfer_local.sh
     transfer_db.sh
     transfer_db.conf.example
+    setup_transfer_db_conf.sh
     generate_db_json_local.sh
     check_platform_explorer_vs_dashmate.sh
 )
