@@ -82,3 +82,81 @@ read_epoch_bounds() {
     [[ "$fb" =~ ^[0-9]+$ && "$lb" =~ ^[0-9]+$ ]] || return 1
     echo "$fb $lb"
 }
+
+# Эпохи 1..N-1 в db.json не трогаем. Текущая N — только PE-прогон, не baseline с 96.43.
+clear_db_json_current_epoch_blocks() {
+    local db="$1" epoch="$2"
+    local tmp
+    tmp=$(mktemp "${db}.clearce.XXXXXX")
+    jq --argjson ce "$epoch" '
+        .validators |= with_entries(
+            .value.withdrawals |= (
+                if any(.[]?; .epoch == $ce) then
+                    map(if .epoch == $ce then .blocks = 0 else . end)
+                else
+                    (. + [{epoch: $ce, blocks: 0, withdrawal: (.[0].withdrawal // 0)}])
+                    | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
+                end
+            )
+        )
+    ' "$db" >"$tmp"
+    mv -f "$tmp" "$db"
+}
+
+# Убрать из cache высоты текущей эпохи (h >= firstBlock) перед PE-прогоном.
+trim_cache_from_epoch_first() {
+    local fb="$1"
+    local save="${SAVE_DIR:-$HOME/tmp/withdrawals}"
+    local cache_dir="$save/cache/validators"
+    local f protx lines
+    [[ "$fb" =~ ^[0-9]+$ ]] || return 1
+    [[ -d "$cache_dir" ]] || return 0
+    for f in "$cache_dir"/*_all_blocks.txt; do
+        [[ -f "$f" ]] || continue
+        protx=$(basename "$f" _all_blocks.txt)
+        lines=$(awk -v b="$fb" '$1 < b' "$f" 2>/dev/null || true)
+        if [[ -n "$lines" ]]; then
+            printf '%s\n' "$lines" >"$f"
+        else
+            : >"$f"
+        fi
+        wc -l <"$f" | tr -d '[:space:]' >"${cache_dir}/${protx}_info.txt"
+        rm -f "${cache_dir}/${protx}_last_block.json"
+    done
+}
+
+# {proTx}_last_block.json — время последнего предложенного блока (PE / patch / seed).
+write_last_block_meta() {
+    local protx="${1,,}" height="$2" timestamp="${3:-}" epoch="${4:-}"
+    local save="${SAVE_DIR:-$HOME/tmp/withdrawals}"
+    local cache_dir="$save/cache/validators"
+    local meta_file="$cache_dir/${protx}_last_block.json"
+    local ts_ms="" existing_h=0
+    [[ -n "$protx" && "$height" =~ ^[0-9]+$ ]] || return 1
+    mkdir -p "$cache_dir"
+
+    if [[ -f "$meta_file" ]]; then
+        existing_h=$(jq -r '.height // 0' "$meta_file" 2>/dev/null || echo 0)
+        if [[ "$existing_h" =~ ^[0-9]+$ ]] && (( existing_h > height )); then
+            return 0
+        fi
+    fi
+
+    if [[ -n "$timestamp" ]]; then
+        ts_ms=$(python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('${timestamp}'.replace('Z','+00:00')).timestamp()*1000))" 2>/dev/null || true)
+    fi
+    if [[ -z "$ts_ms" || ! "$ts_ms" =~ ^[0-9]+$ ]]; then
+        local pe_url="${PLATFORM_EXPLORER_URL:-http://127.0.0.1:3005}"
+        local bts
+        bts=$(curl -sS --max-time 15 "${pe_url%/}/blocks?height_min=${height}&height_max=${height}&limit=1" 2>/dev/null \
+            | jq -r '.resultSet[0].header.timestamp // empty')
+        if [[ -n "$bts" ]]; then
+            ts_ms=$(python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('${bts}'.replace('Z','+00:00')).timestamp()*1000))" 2>/dev/null || true)
+        fi
+    fi
+    [[ -n "$ts_ms" && "$ts_ms" =~ ^[0-9]+$ ]] || return 1
+
+    jq -n --argjson h "$height" --argjson t "$ts_ms" \
+        --argjson e "$([[ -n "$epoch" && "$epoch" =~ ^[0-9]+$ ]] && echo "$epoch" || echo null)" \
+        '{height: $h, timestamp_ms: $t, epoch: (if $e == null then null else $e end)}' >"$meta_file"
+}

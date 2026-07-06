@@ -16,6 +16,7 @@
 #
 #   --with-cache   rsync cache/validators/*_all_blocks.txt с platformExp
 #   --reconcile    после копирования: reconcile_db_json_blocks_from_cache.sh (нужен cache + PE)
+#   --seed-local   для 254: обход всех валидаторов локальным PE (текущая эпоха) + --reset-patch
 set -euo pipefail
 
 BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,6 +29,7 @@ LOCAL_SAVE="${SAVE_DIR:-$HOME/tmp/withdrawals}"
 
 WITH_CACHE=0
 DO_RECONCILE=0
+DO_SEED_LOCAL=0
 ARGS=()
 
 usage() {
@@ -38,7 +40,9 @@ usage() {
 
   --with-cache   sync_validator_blocks_cache.sh с platformExp
   --reconcile    пересчитать blocks текущей эпохи из cache (подразумевает --with-cache при remote)
+  --seed-local   seed_current_epoch_blocks_cache.sh --reset-patch (локальный PE, без cache с 96.43)
 
+  Для 254 (рекомендуется): ... --seed-local
   Без аргументов — SCP с mno@161.97.96.43 (REMOTE_HOST).
 USAGE
     exit 1
@@ -48,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --with-cache) WITH_CACHE=1; shift ;;
         --reconcile) DO_RECONCILE=1; WITH_CACHE=1; shift ;;
+        --seed-local) DO_SEED_LOCAL=1; shift ;;
         -h|--help) usage ;;
         *) ARGS+=("$1"); shift ;;
     esac
@@ -59,6 +64,15 @@ copy_from_remote() {
     echo "=== baseline с $host ==="
     scp "${host}:${REMOTE_SAVE}/db.json" "${LOCAL_DB}.tmp"
     mv -f "${LOCAL_DB}.tmp" "$LOCAL_DB"
+    if [[ "$DO_SEED_LOCAL" -eq 1 ]]; then
+        # shellcheck source=lib_db_json_blocks.sh
+        source "$BIN/lib_db_json_blocks.sh"
+        ce=$(jq -r '.current_epoch // empty' "$LOCAL_DB")
+        if [[ -n "$ce" && "$ce" =~ ^[0-9]+$ ]]; then
+            echo "  обнулить blocks эпохи $ce в db.json (254: текущая эпоха только из PE)"
+            clear_db_json_current_epoch_blocks "$LOCAL_DB" "$ce"
+        fi
+    fi
     mkdir -p "$LOCAL_SAVE/tmp"
     scp "${host}:${REMOTE_SAVE}/tmp/epoch_bounds.txt" "${LOCAL_SAVE}/tmp/epoch_bounds.txt.tmp" 2>/dev/null \
         && mv -f "${LOCAL_SAVE}/tmp/epoch_bounds.txt.tmp" "${LOCAL_SAVE}/tmp/epoch_bounds.txt" \
@@ -80,7 +94,9 @@ copy_from_remote() {
             DO_RECONCILE=0
         fi
     fi
-    if [[ "$DO_RECONCILE" -eq 1 ]]; then
+    if [[ "$DO_SEED_LOCAL" -eq 1 ]]; then
+        bash "$BIN/seed_current_epoch_blocks_cache.sh" --reset-patch
+    elif [[ "$DO_RECONCILE" -eq 1 ]]; then
         bash "$BIN/reconcile_db_json_blocks_from_cache.sh"
     fi
     echo "Готово: $LOCAL_DB + артефакты в $LOCAL_SAVE"

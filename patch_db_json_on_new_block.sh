@@ -111,7 +111,11 @@ fetch_blocks_page() {
     local url resp
     url="${PLATFORM_EXPLORER_URL%/}/blocks?height_min=${h_min}&height_max=${h_max}&limit=100&page=${page}&order=asc"
     resp=$(curl -sS --max-time 30 "$url" 2>/dev/null) || return 1
-    echo "$resp" | jq -c '(.resultSet // []) | map({height: .header.height, validator: ((.header.validator // "") | ascii_downcase)})'
+    echo "$resp" | jq -c '(.resultSet // []) | map({
+        height: .header.height,
+        validator: ((.header.validator // "") | ascii_downcase),
+        timestamp: (.header.timestamp // "")
+    })'
 }
 
 check_epoch_match() {
@@ -195,6 +199,7 @@ run_once() {
             [[ -z "$line" ]] && continue
             ht=$(echo "$line" | jq -r '.height // empty')
             vt=$(echo "$line" | jq -r '.validator // empty')
+            bts=$(echo "$line" | jq -r '.timestamp // empty')
             [[ -z "$vt" ]] && continue
 
             if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -203,6 +208,7 @@ run_once() {
                 if jq -e --arg h "$vt" '.validators[$h]' "$DB_JSON" >/dev/null 2>&1; then
                     patch_one_block "$DB_JSON" "$vt" "$cur_epoch" "$ht"
                     append_validator_block_cache "$vt" "$ht" || true
+                    write_last_block_meta "$vt" "$ht" "$bts" "$cur_epoch" || true
                     log "+1 epoch=$cur_epoch height=$ht proposer=${vt:0:16}…"
                 else
                     log "WARN: proposer $vt не в db.json (height=$ht) — пропуск"

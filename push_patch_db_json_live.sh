@@ -12,6 +12,7 @@ FILES=(
     patch_db_json_live.sh
     patch_db_json_on_new_block.sh
     lib_db_json_blocks.sh
+    seed_current_epoch_blocks_cache.sh
     reconcile_db_json_blocks_from_cache.sh
     sync_validator_blocks_cache.sh
     monitor_new_blocks_count.sh
