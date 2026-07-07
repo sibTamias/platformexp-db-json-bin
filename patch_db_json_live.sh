@@ -146,6 +146,8 @@ main() {
     export SAVE_DIR PLATFORM_EXPLORER_URL
     export DB_JSON_KEEP_DIAG=1
     export SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK="${SKIP_EXPLORER_DASHMATE_HEIGHT_CHECK:-}"
+    # Блоки уже в db.json (patch_db_json_on_new_block / reconcile); live — только баланс/withdrawal/rating.
+    export INCREMENTAL_V1_SKIP_BLOCKS="${INCREMENTAL_V1_SKIP_BLOCKS:-1}"
 
     if ! bash "$GENERATOR" --incremental-v1 >>"$LIVE_LOG" 2>&1; then
         log "ERROR: generate_db_json_local.sh --incremental-v1 failed"
@@ -153,6 +155,13 @@ main() {
     fi
 
     apply_result
+
+    RECONCILE="$BIN/reconcile_db_json_blocks_from_cache.sh"
+    if [[ -x "$RECONCILE" ]]; then
+        log "reconcile: blocks из cache → db.json"
+        bash "$RECONCILE" --quiet || log "WARN: reconcile rc=$?"
+    fi
+
     log "=== patch_db_json_live done ==="
 }
 

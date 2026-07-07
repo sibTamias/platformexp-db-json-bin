@@ -61,6 +61,9 @@ DASH_CLI="${DASH_CLI:-dashmate exec dash_core dash-cli}"
 TEST_RANDOM_LIMIT=0
 # Инкрементальное обновление db.json при той же эпохе (см. --incremental-v1).
 INCREMENTAL_V1=0
+# Фаза 1 (get_validator_blocks × 614) пропускается — blocks текущей эпохи из db.json
+# (patch_db_json_on_new_block / reconcile_db_json_blocks_from_cache).
+INCREMENTAL_V1_SKIP_BLOCKS="${INCREMENTAL_V1_SKIP_BLOCKS:-0}"
 # --fresh-logs: совместимость (diag обнуляется при каждом запуске по умолчанию).
 FRESH_LOGS=0
 while [[ $# -gt 0 ]]; do
@@ -1683,17 +1686,30 @@ incremental_v1_run() {
     mkdir -p "$inc_dir"
     rm -f "$inc_dir"/ceb_*.txt "$inc_dir"/patch_*.ndjson 2>/dev/null || true
 
-    echo "  [incremental-v1] фаза 1 — блоки (get_validator_blocks), PARALLEL_JOBS=$PARALLEL_JOBS, валидаторов=$total"
     t_phase1=$(date +%s)
-    for ((batch_start=0; batch_start < total; batch_start+=PARALLEL_JOBS)); do
-        for ((j=0; j<PARALLEL_JOBS && batch_start+j < total; j++)); do
-            i=$((batch_start + j))
-            incremental_v1_blocks_worker "$i" "$json_file" "$curEpoch" "$bounds_file" "$inc_dir" &
+    if [[ "${INCREMENTAL_V1_SKIP_BLOCKS:-0}" -eq 1 ]]; then
+        echo "  [incremental-v1] фаза 1 — пропуск get_validator_blocks (blocks из db.json, INCREMENTAL_V1_SKIP_BLOCKS=1)"
+        for ((i=0; i<total; i++)); do
+            h="${VALIDATORS[$i]}"
+            ceb=$(jq -r --arg h "$h" --argjson ce "$curEpoch" '
+                .validators[$h].withdrawals[]? | select(.epoch == $ce) | .blocks // 0
+            ' "$json_file" 2>/dev/null | head -1)
+            [[ -z "$ceb" || "$ceb" == "null" ]] && ceb=0
+            echo "$ceb" >"${inc_dir}/ceb_${i}.txt"
         done
-        wait
-        batch=$((batch_start + (PARALLEL_JOBS < total - batch_start ? PARALLEL_JOBS : total - batch_start)))
-        [[ $((batch % 100)) -eq 0 || $batch -eq $total ]] && echo "    фаза 1: $batch/$total"
-    done
+        echo "    фаза 1: $total/$total (из db.json)"
+    else
+        echo "  [incremental-v1] фаза 1 — блоки (get_validator_blocks), PARALLEL_JOBS=$PARALLEL_JOBS, валидаторов=$total"
+        for ((batch_start=0; batch_start < total; batch_start+=PARALLEL_JOBS)); do
+            for ((j=0; j<PARALLEL_JOBS && batch_start+j < total; j++)); do
+                i=$((batch_start + j))
+                incremental_v1_blocks_worker "$i" "$json_file" "$curEpoch" "$bounds_file" "$inc_dir" &
+            done
+            wait
+            batch=$((batch_start + (PARALLEL_JOBS < total - batch_start ? PARALLEL_JOBS : total - batch_start)))
+            [[ $((batch % 100)) -eq 0 || $batch -eq $total ]] && echo "    фаза 1: $batch/$total"
+        done
+    fi
     echo "  [incremental-v1] фаза 1: $(( $(date +%s) - t_phase1 )) сек"
 
     for ((i=0; i<total; i++)); do
@@ -1749,23 +1765,44 @@ incremental_v1_run() {
     merged_out=$(mktemp)
     patches_json=$(jq -s '.' "$patches_ndjson")
     rm -f "$patches_ndjson"
-    jq --argjson PATCHES "$patches_json" '
-        reduce $PATCHES[] as $p (.;
-            if .validators[$p.h] == null then .
-            else
-                .validators[$p.h].identityBalance = $p.ib
-                | .validators[$p.h].rating = $p.rating
-                | .validators[$p.h].withdrawals |= (
-                    ($p.ce) as $ce
-                    | if any(.[]; .epoch == $ce) then
-                        map(if .epoch == $ce then {epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
-                      else
-                        . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
-                      end
+    if [[ "${INCREMENTAL_V1_SKIP_BLOCKS:-0}" -eq 1 ]]; then
+        echo "  [incremental-v1] merge: blocks не трогаем (INCREMENTAL_V1_SKIP_BLOCKS=1)"
+        jq --argjson PATCHES "$patches_json" '
+            reduce $PATCHES[] as $p (.;
+                if .validators[$p.h] == null then .
+                else
+                    .validators[$p.h].identityBalance = $p.ib
+                    | .validators[$p.h].rating = $p.rating
+                    | .validators[$p.h].withdrawals |= (
+                        ($p.ce) as $ce
+                        | if any(.[]; .epoch == $ce) then
+                            map(if .epoch == $ce then {epoch: $ce, blocks: .blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
+                          else
+                            . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
+                          end
                     )
-            end
-        )
-    ' "$json_file" >"$merged_out" && mv "$merged_out" "$json_file"
+                end
+            )
+        ' "$json_file" >"$merged_out" && mv "$merged_out" "$json_file"
+    else
+        jq --argjson PATCHES "$patches_json" '
+            reduce $PATCHES[] as $p (.;
+                if .validators[$p.h] == null then .
+                else
+                    .validators[$p.h].identityBalance = $p.ib
+                    | .validators[$p.h].rating = $p.rating
+                    | .validators[$p.h].withdrawals |= (
+                        ($p.ce) as $ce
+                        | if any(.[]; .epoch == $ce) then
+                            map(if .epoch == $ce then {epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
+                          else
+                            . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
+                          end
+                    )
+                end
+            )
+        ' "$json_file" >"$merged_out" && mv "$merged_out" "$json_file"
+    fi
 
     t_end=$(date +%s)
     GENERATE_TOTAL_SEC=$((t_end - t_start))
