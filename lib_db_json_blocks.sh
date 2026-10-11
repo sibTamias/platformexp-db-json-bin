@@ -69,7 +69,7 @@ count_epoch_blocks_from_cache() {
     local save="${SAVE_DIR:-$HOME/tmp/withdrawals}"
     local cache_file="$save/cache/validators/${protx}_all_blocks.txt"
     [[ -f "$cache_file" ]] || { echo 0; return; }
-    awk -v b="$fb" -v c="$ub" '$1 >= b && $1 <= c {count++} END {print count+0}' "$cache_file"
+    awk -v b="$fb" -v c="$ub" '($1+0) >= b && ($1+0) <= c && !seen[$1]++ {count++} END {print count+0}' "$cache_file"
 }
 
 read_epoch_bounds() {

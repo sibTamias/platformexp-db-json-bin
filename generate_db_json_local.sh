@@ -586,6 +586,27 @@ cached_block_timestamp() {
     echo "${ts:-0}"
 }
 
+# Повтор одной и той же высоты в кэше (перекрытие страниц API) раздувает blocks эпохи.
+dedupe_height_file() {
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    if sort -n -c "$f" 2>/dev/null && ! uniq -d "$f" | grep -q .; then
+        return 0
+    fi
+    sort -n "$f" | uniq > "${f}.uniq"
+    mv -f "${f}.uniq" "$f"
+}
+
+# inclusive=1 → высота <= hi (текущая эпоха); иначе hi исключительная (первый блок следующей эпохи).
+count_unique_heights() {
+    local file="$1" lo="$2" hi="$3" inclusive="${4:-0}"
+    if [[ "$inclusive" == "1" ]]; then
+        awk -v b="$lo" -v c="$hi" '($1+0) >= b && ($1+0) <= c && !seen[$1]++ {n++} END {print n+0}' "$file"
+    else
+        awk -v b="$lo" -v c="$hi" '($1+0) >= b && ($1+0) < c && !seen[$1]++ {n++} END {print n+0}' "$file"
+    fi
+}
+
 get_validator_blocks() {
     local validator=$1
     local cache_dir="$SAVE_DIR/cache/validators"
@@ -593,6 +614,19 @@ get_validator_blocks() {
     local cache_info_file="$cache_dir/${validator}_info.txt"
     local limit=100
     mkdir -p "$cache_dir"
+    if [[ -f "$cache_file" ]]; then
+        local lines_before lines_after info_n
+        lines_before=$(wc -l <"$cache_file" | tr -d '\r\n ')
+        dedupe_height_file "$cache_file"
+        lines_after=$(wc -l <"$cache_file" | tr -d '\r\n ')
+        if [[ "$lines_before" =~ ^[0-9]+$ && "$lines_after" =~ ^[0-9]+$ && "$lines_after" -lt "$lines_before" && -f "$cache_info_file" ]]; then
+            info_n=$(tr -d '\r\n ' <"$cache_info_file")
+            if [[ "$info_n" =~ ^[0-9]+$ && "$info_n" -gt "$lines_after" ]]; then
+                echo "$lines_after" >"$cache_info_file"
+            fi
+            log_diag_append "$(date -Is) DEDUPE_VALIDATOR_BLOCKS validator=$validator before=$lines_before after=$lines_after"
+        fi
+    fi
     local current_total
     local blocks_meta
     platform_explorer_pace
@@ -670,22 +704,42 @@ get_validator_blocks() {
         fi
         echo "$page_body" | jq -r '(.resultSet // [])[].header.height' >> "$temp_file"
     done
+    local raw_count
+    raw_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
+    dedupe_height_file "$temp_file"
     line_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
     extra=0
-    while [[ "$current_total" =~ ^[0-9]+$ && "$line_count" -lt "$current_total" && $extra -lt 40 ]]; do
+    while [[ "$current_total" =~ ^[0-9]+$ && "$line_count" -lt "$current_total" && "$raw_count" -lt "$current_total" && $extra -lt 40 ]]; do
         extra=$((extra + 1))
         j=$((numPage + extra))
         page_url="${PLATFORM_EXPLORER_URL}/validator/${validator}/blocks?page=$j&limit=100&order=asc"
         platform_explorer_pace
         page_body=$(curl -sS --max-time "$CURL_WITH_RETRY_MAX_TIME" -X GET "$page_url")
         [[ -n "${page_body//[$'\t\r\n ']}" ]] && echo "$page_body" | jq -r '(.resultSet // [])[].header.height' >> "$temp_file"
+        raw_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
+        dedupe_height_file "$temp_file"
         line_count=$(wc -l <"$temp_file" | tr -d '\r\n ')
     done
     if [[ "$extra" -gt 0 ]]; then
         log_diag_append "$(date -Is) GET_validator_blocks extra_pages validator=$validator extra=$extra total=$current_total lines=$line_count"
     fi
+    # Не затирать полный кэш усечённым ответом API.
+    if [[ -f "$cache_file" && "$line_count" =~ ^[0-9]+$ ]]; then
+        local old_unique
+        old_unique=$(wc -l <"$cache_file" | tr -d '\r\n ')
+        if [[ "$old_unique" =~ ^[0-9]+$ && "$old_unique" -gt 0 && "$line_count" -lt "$old_unique" ]]; then
+            log_diag_append "$(date -Is) REFUSE_SHRINK_VALIDATOR_BLOCKS validator=$validator old=$old_unique new=$line_count total=$current_total"
+            cat "$cache_file"
+            return
+        fi
+    fi
     cp "$temp_file" "$cache_file"
-    echo "$current_total" > "$cache_info_file"
+    # pagination.total иногда считает повтор страницы. В info — число уникальных высот.
+    if [[ "$current_total" =~ ^[0-9]+$ && "$line_count" =~ ^[0-9]+$ && "$line_count" -lt "$current_total" && "$raw_count" -ge "$current_total" ]]; then
+        echo "$line_count" > "$cache_info_file"
+    else
+        echo "$current_total" > "$cache_info_file"
+    fi
     cat "$temp_file"
 }
 
@@ -963,14 +1017,14 @@ process_validator_rebuild() {
         for (( epoch=$((fixed_max + 1)); epoch < curEpoch; epoch++ )); do
             firstBlockEpoch=${epoch_first_blocks[$epoch]}
             lastBlockEpoch=${epoch_last_blocks[$epoch]}
-            blocks_count=$(awk -v b="$firstBlockEpoch" -v c="$lastBlockEpoch" '$1 >= b && $1 < c {count++} END {print count+0}' "$blocks_file")
+            blocks_count=$(count_unique_heights "$blocks_file" "$firstBlockEpoch" "$lastBlockEpoch" 0)
             confirmed_blocks_str+="$blocks_count "
         done
     else
         for (( epoch=0; epoch < curEpoch; epoch++ )); do
             firstBlockEpoch=${epoch_first_blocks[$epoch]}
             lastBlockEpoch=${epoch_last_blocks[$epoch]}
-            blocks_count=$(awk -v b="$firstBlockEpoch" -v c="$lastBlockEpoch" '$1 >= b && $1 < c {count++} END {print count+0}' "$blocks_file")
+            blocks_count=$(count_unique_heights "$blocks_file" "$firstBlockEpoch" "$lastBlockEpoch" 0)
             confirmed_blocks_str+="$blocks_count "
         done
         if [[ $fixed_max -ge 0 ]]; then
@@ -980,7 +1034,7 @@ process_validator_rebuild() {
     fi
     firstBlockEpoch=${epoch_first_blocks[$curEpoch]}
     lastBlockEpoch=${epoch_last_blocks[$curEpoch]}
-    current_epoch_blocks=$(awk -v b="$firstBlockEpoch" -v c="$lastBlockEpoch" '$1 >= b && $1 <= c {count++} END {print count+0}' "$blocks_file")
+    current_epoch_blocks=$(count_unique_heights "$blocks_file" "$firstBlockEpoch" "$lastBlockEpoch" 1)
     local response
     # 2>/dev/null: CURL_TRACE при DB_JSON_DEBUG идёт в stderr; при 2>&1 в cron он не должен попадать в $().
     response=$(curl_with_retry "GET_validator" "$validator" "$PLATFORM_EXPLORER_URL/validator/$validator" '.proTxInfo != null' 2>/dev/null)
@@ -1481,10 +1535,16 @@ process_validator_generate() {
     declare -A epoch_amounts=() epoch_blocks=()
     for ((epoch=1; epoch<${#confirmed_blocks_array[@]}; epoch++)); do epoch_blocks["$epoch"]=${confirmed_blocks_array[$epoch]}; done
     [[ $curEpoch -gt 0 ]] && epoch_blocks["$curEpoch"]="$cur_epoch_blocks"
-    local response
+    local response withdrawals_fetch_ok=0
     if [[ -n "$identity" ]]; then
         local _wurl="${PLATFORM_EXPLORER_URL}/identity/${identity}/withdrawals?page=1&limit=100"
         response=$(curl_with_retry "GET_identity_withdrawals" "$validator_hash" "$_wurl" '.resultSet != null' 2>/dev/null)
+        if pe_api_response_ok "$response" '.resultSet != null'; then
+            withdrawals_fetch_ok=1
+        else
+            response='{"resultSet":[]}'
+            log_diag_append "$(date -Is) KEEP_PREV_WITHDRAWALS validator=$validator_hash | пустой ответ /identity/withdrawals, выплаты оставляем из db.json"
+        fi
     else
         response='{"resultSet":[]}'
     fi
@@ -1507,7 +1567,28 @@ process_validator_generate() {
     done < <(echo "$response" | jq -r '.resultSet[]? | [.timestamp, .amount] | @tsv' 2>/dev/null)
     local epochs_json="[]"
     local withdrawals_cache_file="$SAVE_DIR/cache/validators/${validator_hash}_withdrawals_through_${fixed_epoch_max}.json"
-    if [[ $fixed_epoch_max -ge 1 && -f "$withdrawals_cache_file" ]]; then
+    if [[ -n "$identity" && "$withdrawals_fetch_ok" -eq 0 ]]; then
+        # API не отдал выплаты. Не пишем нули в кэш и не затираем db.json.
+        local blocks_json="{" first_block_key=1 ep
+        for ep in "${!epoch_blocks[@]}"; do
+            [[ "$ep" == "0" || ! "$ep" =~ ^[0-9]+$ ]] && continue
+            [[ -n "$registration_epoch" && "$registration_epoch" =~ ^[0-9]+$ && "$ep" -lt "$registration_epoch" ]] && continue
+            [[ $first_block_key -eq 1 ]] && first_block_key=0 || blocks_json+=","
+            blocks_json+="\"$ep\":${epoch_blocks[$ep]}"
+        done
+        blocks_json+="}"
+        epochs_json=$(jq -c --arg h "$validator_hash" --argjson blocks "$blocks_json" '
+            (.validators[$h].withdrawals // []) as $old
+            | reduce ($blocks | to_entries[]) as $e ([];
+                . + [{
+                    epoch: ($e.key | tonumber),
+                    blocks: $e.value,
+                    withdrawal: (([$old[] | select(.epoch == ($e.key | tonumber)) | .withdrawal][0]) // 0)
+                }]
+              )
+            | sort_by(.epoch)
+        ' "$SAVE_DIR/db.json")
+    elif [[ $fixed_epoch_max -ge 1 && -f "$withdrawals_cache_file" ]]; then
         cached_epochs=$(cat "$withdrawals_cache_file")
         recent_json="[]"
         for epoch in "${!epoch_blocks[@]}"; do
@@ -1567,15 +1648,28 @@ incremental_v1_blocks_worker() {
     get_validator_blocks "$h" >"$tmpf"
     fb=$(awk -F: -v e="$curEpoch" '$1==e{print $2; exit}' "$bounds_file")
     lb=$(awk -F: -v e="$curEpoch" '$1==e{print $3; exit}' "$bounds_file")
-    ceb=$(awk -v b="$fb" -v c="$lb" '$1 >= b && $1 <= c {count++} END {print count+0}' "$tmpf")
+    ceb=$(count_unique_heights "$tmpf" "$fb" "$lb" 1)
     rm -f "$tmpf"
     echo "$ceb" >"${out_dir}/ceb_${i}.txt"
+}
+
+# Успешный ответ PE (не rate limit / не пустой JSON).
+pe_api_response_ok() {
+    local resp="$1" required="${2:-}"
+    [[ -n "${resp//[$'\t\r\n ']}" ]] || return 1
+    echo "$resp" | jq -e . >/dev/null 2>&1 || return 1
+    local err
+    err=$(echo "$resp" | jq -r '.error // empty' 2>/dev/null)
+    [[ -n "$err" && "$err" != "null" ]] && return 1
+    [[ -n "$required" ]] && ! echo "$resp" | jq -e "$required" >/dev/null 2>&1 && return 1
+    return 0
 }
 
 incremental_v1_patch_worker() {
     local i="$1" json_file="$2" curEpoch="$3" rating="$4" ceb="$5" out_dir="$6"
     local h identity identityBalance response wresp _wurl wd_raw wd
     local timestamp amount unix_time nEpoch idx2
+    local validator_ok=0 withdrawals_ok=0
     h="${VALIDATORS[$i]}"
     if ! jq -e --arg xx "$h" '.validators[$xx]' "$json_file" >/dev/null 2>&1; then
         return 0
@@ -1584,36 +1678,47 @@ incremental_v1_patch_worker() {
     [[ -z "$identity" || "$identity" == "null" ]] && identity=""
 
     response=$(curl_with_retry "GET_validator" "$h" "$PLATFORM_EXPLORER_URL/validator/$h" '.proTxInfo != null' 2>/dev/null)
-    identityBalance=$(diag_jq_r identityBalance '.identityBalance // 0' "$response" "0")
-    identityBalance=$(awk -v ib="${identityBalance:-0}" 'BEGIN {printf "%.4f", (ib+0)/100000000000}')
-    if [[ -z "$identity" ]]; then
-        identity=$(diag_jq_r identity '.identityId // .identity // empty' "$response" "")
-        [[ -z "$identity" || "$identity" == "null" ]] && identity=""
+    if pe_api_response_ok "$response" '.proTxInfo != null'; then
+        validator_ok=1
+        identityBalance=$(diag_jq_r identityBalance '.identityBalance // 0' "$response" "0")
+        identityBalance=$(awk -v ib="${identityBalance:-0}" 'BEGIN {printf "%.4f", (ib+0)/100000000000}')
+        if [[ -z "$identity" ]]; then
+            identity=$(diag_jq_r identity '.identityId // .identity // empty' "$response" "")
+            [[ -z "$identity" || "$identity" == "null" ]] && identity=""
+        fi
     fi
 
     declare -A epoch_amounts=()
     if [[ -n "$identity" ]]; then
         _wurl="${PLATFORM_EXPLORER_URL}/identity/${identity}/withdrawals?page=1&limit=100"
         wresp=$(curl_with_retry "GET_identity_withdrawals" "$h" "$_wurl" '.resultSet != null' 2>/dev/null)
-        while IFS=$'\t' read -r timestamp amount; do
-            [[ -z "$timestamp" || "$amount" == "null" ]] && continue
-            unix_time=$(date -d "$timestamp" +%s%3N 2>/dev/null)
-            nEpoch=""
-            if [[ -n "$unix_time" && ${#EPOCH_START[@]} -gt 0 ]]; then
-                for idx2 in "${!EPOCH_START[@]}"; do
-                    if [[ "${EPOCH_START[$idx2]}" =~ ^[0-9]+$ && "${EPOCH_END[$idx2]}" =~ ^[0-9]+$ ]]; then
-                        if (( unix_time >= ${EPOCH_START[$idx2]} && unix_time <= ${EPOCH_END[$idx2]} )); then
-                            nEpoch="${EPOCH_NUM[$idx2]}"
-                            break
+        if pe_api_response_ok "$wresp" '.resultSet != null'; then
+            withdrawals_ok=1
+            while IFS=$'\t' read -r timestamp amount; do
+                [[ -z "$timestamp" || "$amount" == "null" ]] && continue
+                unix_time=$(date -d "$timestamp" +%s%3N 2>/dev/null)
+                nEpoch=""
+                if [[ -n "$unix_time" && ${#EPOCH_START[@]} -gt 0 ]]; then
+                    for idx2 in "${!EPOCH_START[@]}"; do
+                        if [[ "${EPOCH_START[$idx2]}" =~ ^[0-9]+$ && "${EPOCH_END[$idx2]}" =~ ^[0-9]+$ ]]; then
+                            if (( unix_time >= ${EPOCH_START[$idx2]} && unix_time <= ${EPOCH_END[$idx2]} )); then
+                                nEpoch="${EPOCH_NUM[$idx2]}"
+                                break
+                            fi
                         fi
-                    fi
-                done
-            fi
-            [[ -z "$nEpoch" || ! "$nEpoch" =~ ^[0-9]+$ || $nEpoch -eq 0 ]] && continue
-            epoch_amounts[$nEpoch]=$((${epoch_amounts[$nEpoch]:-0} + amount))
-        done < <(echo "$wresp" | jq -r '.resultSet[]? | [.timestamp, .amount] | @tsv' 2>/dev/null)
+                    done
+                fi
+                [[ -z "$nEpoch" || ! "$nEpoch" =~ ^[0-9]+$ || $nEpoch -eq 0 ]] && continue
+                epoch_amounts[$nEpoch]=$((${epoch_amounts[$nEpoch]:-0} + amount))
+            done < <(echo "$wresp" | jq -r '.resultSet[]? | [.timestamp, .amount] | @tsv' 2>/dev/null)
+        fi
     else
-        echo "  ВНИМАНИЕ [incremental-v1]: нет identity для $h — withdrawal для эпохи $curEpoch считается 0 (без GET withdrawals)." >&2
+        echo "  ВНИМАНИЕ [incremental-v1]: нет identity для $h — withdrawal для эпохи $curEpoch не обновляем (без GET withdrawals)." >&2
+    fi
+
+    if [[ "$validator_ok" -eq 0 && "$withdrawals_ok" -eq 0 ]]; then
+        echo "  ВНИМАНИЕ [incremental-v1]: PE API fail для $h — сохраняем прежние ib/withdrawal в db.json." >&2
+        return 0
     fi
 
     wd_raw=${epoch_amounts[$curEpoch]:-0}
@@ -1627,7 +1732,9 @@ incremental_v1_patch_worker() {
         --argjson ce "$curEpoch" \
         --argjson blocks "$ceb" \
         --argjson wd "$wd" \
-        '{h:$h, ib:$ib, rating:$rating, ce:$ce, blocks:$blocks, wd:$wd}' >"${out_dir}/patch_${i}.ndjson"
+        --argjson validator_ok "$validator_ok" \
+        --argjson withdrawals_ok "$withdrawals_ok" \
+        '{h:$h, ib:$ib, rating:$rating, ce:$ce, blocks:$blocks, wd:$wd, validator_ok:$validator_ok, withdrawals_ok:$withdrawals_ok}' >"${out_dir}/patch_${i}.ndjson"
 }
 
 # При той же эпохе: без rebuild_arrays / полного generate_json_db — только поля,
@@ -1770,17 +1877,22 @@ incremental_v1_run() {
         jq --argjson PATCHES "$patches_json" '
             reduce $PATCHES[] as $p (.;
                 if .validators[$p.h] == null then .
+                elif ($p.validator_ok | not) and ($p.withdrawals_ok | not) then .
                 else
-                    .validators[$p.h].identityBalance = $p.ib
-                    | .validators[$p.h].rating = $p.rating
-                    | .validators[$p.h].withdrawals |= (
-                        ($p.ce) as $ce
-                        | if any(.[]; .epoch == $ce) then
-                            map(if .epoch == $ce then {epoch: $ce, blocks: .blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
-                          else
-                            . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
-                          end
-                    )
+                    (if ($p.validator_ok // false) then
+                        .validators[$p.h].identityBalance = $p.ib
+                        | .validators[$p.h].rating = $p.rating
+                     else . end)
+                    | (if ($p.withdrawals_ok // false) then
+                        .validators[$p.h].withdrawals |= (
+                            ($p.ce) as $ce
+                            | if any(.[]; .epoch == $ce) then
+                                map(if .epoch == $ce then {epoch: $ce, blocks: .blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
+                              else
+                                . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
+                              end
+                        )
+                      else . end)
                 end
             )
         ' "$json_file" >"$merged_out" && mv "$merged_out" "$json_file"
@@ -1788,17 +1900,22 @@ incremental_v1_run() {
         jq --argjson PATCHES "$patches_json" '
             reduce $PATCHES[] as $p (.;
                 if .validators[$p.h] == null then .
+                elif ($p.validator_ok | not) and ($p.withdrawals_ok | not) then .
                 else
-                    .validators[$p.h].identityBalance = $p.ib
-                    | .validators[$p.h].rating = $p.rating
-                    | .validators[$p.h].withdrawals |= (
-                        ($p.ce) as $ce
-                        | if any(.[]; .epoch == $ce) then
-                            map(if .epoch == $ce then {epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
-                          else
-                            . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
-                          end
-                    )
+                    (if ($p.validator_ok // false) then
+                        .validators[$p.h].identityBalance = $p.ib
+                        | .validators[$p.h].rating = $p.rating
+                     else . end)
+                    | (if ($p.withdrawals_ok // false) then
+                        .validators[$p.h].withdrawals |= (
+                            ($p.ce) as $ce
+                            | if any(.[]; .epoch == $ce) then
+                                map(if .epoch == $ce then {epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd} else {epoch, blocks, withdrawal} end)
+                              else
+                                . + [{epoch: $ce, blocks: $p.blocks, withdrawal: $p.wd}] | map({epoch, blocks, withdrawal}) | sort_by(.epoch)
+                              end
+                        )
+                      else . end)
                 end
             )
         ' "$json_file" >"$merged_out" && mv "$merged_out" "$json_file"
